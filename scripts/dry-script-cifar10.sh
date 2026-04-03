@@ -6,4 +6,5 @@ torchrun --standalone --nproc_per_node=1 train.py \
     --fp16 \
     --status=1Ki \
     --snapshot=64Ki \
-    --checkpoint=128Ki
+    --checkpoint=128Ki \
+    --dry-run

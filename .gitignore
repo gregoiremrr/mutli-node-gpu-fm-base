@@ -1,1 +1,13 @@
+# Cache
 .DS_Store
+.venv/
+dnnlib/__pycache__/
+torch_utils/__pycache__/
+training/__pycache__/
+
+# Folders to keep clean in the git
+datasets/*
+training-runs/*
+
+# Keep the previous folders empty
+!**/.gitkeep

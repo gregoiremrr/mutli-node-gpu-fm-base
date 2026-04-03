@@ -38,7 +38,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
         if opts.get(key, None) is None:
             opts[key] = value
 
-    # Dataset.
+    # Dataset and Dataloader.
     c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond)
     try:
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
@@ -48,6 +48,12 @@ def setup_training_config(preset='fm-cifar10', **opts):
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
+    c.data_loader_kwargs = dict(
+        class_name='torch.utils.data.DataLoader',
+        pin_memory=True,
+        num_workers=2,
+        prefetch_factor=2
+    )
 
     # Encoder.
     if dataset_channels == 3:
@@ -64,21 +70,23 @@ def setup_training_config(preset='fm-cifar10', **opts):
         class_name='training.model.FlowMatchingModel',
         sigma_data=0.5,
         net_kwargs=dnnlib.EasyDict(
-            class_name='SongUNet',
+            class_name='training.networks.SongUNet',
             embedding_type='positional',
             encoder_type='standard',
             decoder_type='standard',
             channel_mult_noise=1,
             resample_filter=[1, 1],
             model_channels=opts.channels,
-            channel_mult=opts.channel_mult,
+            channel_mult=[2, 2, 2],
             dropout=opts.dropout
         ),
         use_fp16 = opts.fp16
     )
+    c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA')
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss')
+    c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.99))
     c.lr_kwargs = dnnlib.EasyDict(
-        func_name='training.training_loop.cosine_lr',
+        func_name='training.schedulers.cosine_lr',
         base_lr=opts.lr,
         total_nimg=opts.total_nimg
     )
@@ -109,7 +117,7 @@ def print_training_config(run_dir, c):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
-    dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+    dist.print0(f'Mixed-precision:         {c.model_kwargs.use_fp16}')
     dist.print0()
 
 #----------------------------------------------------------------------------
@@ -164,6 +172,9 @@ def parse_nimg(s):
 
 # Performance-related options.
 @click.option('--max-batch-gpu',    help='Limit batch size per GPU', metavar='NIMG',            type=parse_nimg, default=None, show_default=True)
+@click.option('--pin-memory',       help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
+@click.option('--num-workers',      help='Number of workers in the dataloader', metavar='BOOL', default=True, show_default=True)
+@click.option('--prefetch_factor',  help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
 @click.option('--fp16/--no-fp16',   help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
 @click.option('--ls',               help='Loss scaling', metavar='FLOAT',                       type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',            help='Enable cuDNN benchmarking', metavar='BOOL',           type=bool, default=True, show_default=True)

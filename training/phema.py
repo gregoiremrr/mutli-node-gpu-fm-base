@@ -89,29 +89,29 @@ def solve_posthoc_coefficients(in_ofs, in_std, out_ofs, out_std): # => [in, out]
 
 class PowerFunctionEMA:
     @torch.no_grad()
-    def __init__(self, net, stds=[0.050, 0.100]):
-        self.net = net
+    def __init__(self, model, stds=[0.050, 0.100]):
+        self.model = model
         self.stds = stds
-        self.emas = [copy.deepcopy(net) for _std in stds]
+        self.emas = [copy.deepcopy(model) for _std in stds]
 
     @torch.no_grad()
     def reset(self):
         for ema in self.emas:
-            for p_net, p_ema in zip(self.net.parameters(), ema.parameters()):
-                p_ema.copy_(p_net)
+            for p_model, p_ema in zip(self.model.parameters(), ema.parameters()):
+                p_ema.copy_(p_model)
 
     @torch.no_grad()
     def update(self, cur_nimg, batch_size):
         for std, ema in zip(self.stds, self.emas):
             beta = power_function_beta(std=std, t_next=cur_nimg, t_delta=batch_size)
-            for p_net, p_ema in zip(self.net.parameters(), ema.parameters()):
-                p_ema.lerp_(p_net, 1 - beta)
+            for p_model, p_ema in zip(self.model.parameters(), ema.parameters()):
+                p_ema.lerp_(p_model, 1 - beta)
 
     @torch.no_grad()
     def get(self):
         for ema in self.emas:
-            for p_net, p_ema in zip(self.net.buffers(), ema.buffers()):
-                p_ema.copy_(p_net)
+            for p_model, p_ema in zip(self.model.buffers(), ema.buffers()):
+                p_ema.copy_(p_model)
         return [(ema, f'-{std:.3f}') for std, ema in zip(self.stds, self.emas)]
 
     def state_dict(self):
@@ -127,16 +127,16 @@ class PowerFunctionEMA:
 
 class TraditionalEMA:
     @torch.no_grad()
-    def __init__(self, net, halflife_Mimg=float('inf'), rampup_ratio=0.09):
-        self.net = net
+    def __init__(self, model, halflife_Mimg=float('inf'), rampup_ratio=0.09):
+        self.model = model
         self.halflife_Mimg = halflife_Mimg
         self.rampup_ratio = rampup_ratio
-        self.ema = copy.deepcopy(net)
+        self.ema = copy.deepcopy(model)
 
     @torch.no_grad()
     def reset(self):
-        for p_net, p_ema in zip(self.net.parameters(), self.ema.parameters()):
-            p_ema.copy_(p_net)
+        for p_model, p_ema in zip(self.model.parameters(), self.ema.parameters()):
+            p_ema.copy_(p_model)
 
     @torch.no_grad()
     def update(self, cur_nimg, batch_size):
@@ -144,13 +144,13 @@ class TraditionalEMA:
         if self.rampup_ratio is not None:
             halflife_Mimg = min(halflife_Mimg, cur_nimg / 1e6 * self.rampup_ratio)
         beta = 0.5 ** (batch_size / max(halflife_Mimg * 1e6, 1e-8))
-        for p_net, p_ema in zip(self.net.parameters(), self.ema.parameters()):
-            p_ema.lerp_(p_net, 1 - beta)
+        for p_model, p_ema in zip(self.model.parameters(), self.ema.parameters()):
+            p_ema.lerp_(p_model, 1 - beta)
 
     @torch.no_grad()
     def get(self):
-        for p_net, p_ema in zip(self.net.buffers(), self.ema.buffers()):
-            p_ema.copy_(p_net)
+        for p_model, p_ema in zip(self.model.buffers(), self.ema.buffers()):
+            p_ema.copy_(p_model)
         return self.ema
 
     def state_dict(self):

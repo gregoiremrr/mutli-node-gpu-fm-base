@@ -54,4 +54,22 @@ class FlowMatchingModel(torch.nn.Module):
         v_pred = (pred - xt) / (1 - t_broad).clamp(min=self.eps)
         return v_pred
 
+    def sample(self, class_labels, n_samples, n_steps, device):
+        dt = 1.0 / n_steps
+        x = torch.randn(
+            n_samples, self.img_channels, self.img_resolution, self.img_resolution,
+            device=device
+        ) * self.sigma_data
+
+        with torch.no_grad():
+            for i in range(n_steps):
+                t = torch.full([n_samples], i * dt, device=device)
+                k1 = self(x, t, class_labels=class_labels)
+                x_pred = x + dt * k1
+                t_next = torch.full([n_samples], (i + 1) * dt, device=device)
+                k2 = self(x_pred, t_next, class_labels=class_labels)
+                x = x + 0.5 * dt * (k1 + k2)
+
+        return x
+
 #----------------------------------------------------------------------------

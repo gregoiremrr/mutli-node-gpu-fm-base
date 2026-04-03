@@ -18,28 +18,30 @@ from training.monitoring import log_to_wandb
 def training_loop(
     dataset_kwargs,
     encoder_kwargs,
-    data_loader_kwargs, # issue
+    data_loader_kwargs,
     model_kwargs,
     loss_kwargs,
-    optimizer_kwargs, # issue
+    optimizer_kwargs,
     lr_kwargs,
-    ema_kwargs, # issue
+    ema_kwargs,
     max_clip_norm,
 
-    run_dir,            # Output directory.
-    seed,               # Global random seed.
-    batch_size,         # Total batch size for one training iteration.
-    max_batch_gpu,      # Limit batch size per GPU. None = no limit.
-    total_nimg,         # Train for a total of N training images.
-    status_nimg,        # Report status every N training images. None = disable.
-    snapshot_nimg,      # Save network snapshot every N training images. None = disable.
-    checkpoint_nimg,    # Save state checkpoint every N training images. None = disable.
+    run_dir,                # Output directory.
+    seed,                   # Global random seed.
+    batch_size,             # Total batch size for one training iteration.
+    max_batch_gpu,          # Limit batch size per GPU. None = no limit.
+    total_nimg,             # Train for a total of N training images.
+    status_nimg,            # Report status every N training images. None = disable.
+    snapshot_nimg,          # Save network snapshot every N training images. None = disable.
+    checkpoint_nimg,        # Save state checkpoint every N training images. None = disable.
 
-    loss_scaling,       # Loss scaling factor for reducing FP16 under/overflows.
-    force_finite,       # Get rid of NaN/Inf gradients before feeding them to the optimizer. # issue
-    cudnn_benchmark,    # Enable torch.backends.cudnn.benchmark?
-    device # issue
+    loss_scaling,           # Loss scaling factor for reducing FP16 under/overflows.
+    cudnn_benchmark,        # Enable torch.backends.cudnn.benchmark?
+    force_finite = True,    # Get rid of NaN/Inf gradients before feeding them to the optimizer.
 ):
+    # Device.
+    device = torch.device('cuda')
+
     # Initialize.
     prev_status_time = time.time()
     misc.set_random_seed(seed, dist.get_rank())
@@ -197,6 +199,7 @@ def training_loop(
             break
 
         # Evaluate loss and accumulate gradients.
+        step_stats.loss = 0
         batch_start_time = time.time()
         misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
         optimizer.zero_grad(set_to_none=True)
@@ -204,9 +207,11 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss = loss_fn(net=ddp, images=images, labels=labels.to(device))
+                loss = loss_fn(model=ddp, images=images, labels=labels.to(device))
+                loss = loss.mean().mul(loss_scaling)
                 training_stats.report('Loss/loss', loss)
-                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                step_stats.loss += loss.item()
+                loss.backward()
 
         # Run optimizer and update weights.
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)
@@ -217,7 +222,15 @@ def training_loop(
             for param in model.parameters():
                 if param.grad is not None:
                     torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
+        clip_coef = min(1.0, max_clip_norm / (grad_norm.item() + 1e-12))
+
         optimizer.step()
+
+        step_stats.loss /= num_accumulation_rounds
+        step_stats.grad_norm = grad_norm.item()
+        step_stats.clip_coef = clip_coef
 
         # Update EMA and training state.
         state.cur_nimg += batch_size
