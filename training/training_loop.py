@@ -221,11 +221,18 @@ def training_loop(
         training_stats.report('Loss/learning_rate', lr)
         for g in optimizer.param_groups:
             g['lr'] = lr
-        if force_finite:
-            for param in model.parameters():
-                if param.grad is not None:
-                    torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+
+        # Unscale the gradients
+        inv_scale = 1 / loss_scaling
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.mul_(inv_scale) # In-place multiplication
+                
+                if force_finite:
+                    torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
+
+        # Clip
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
 
         optimizer.step()
 
