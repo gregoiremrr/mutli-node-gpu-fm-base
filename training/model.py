@@ -50,9 +50,10 @@ class FlowMatchingModel(torch.nn.Module):
         pred = self.sigma_data * F_x.to(torch.float32)
         if self.pred == "v":
             return pred
-        t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
-        v_pred = (pred - xt) / (1 - t_broad).clamp(min=self.eps)
-        return v_pred
+        elif self.pred == "x":
+            t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
+            v_pred = (pred - xt) / (1 - t_broad).clamp(min=self.eps)
+            return v_pred
 
     def sample(self, class_labels, n_samples, n_steps, device):
         dt = 1.0 / n_steps

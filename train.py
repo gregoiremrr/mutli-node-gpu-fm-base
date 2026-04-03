@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only
 
 config_presets = {
     'fm-cifar10': dnnlib.EasyDict(
-        total_nimg=200_000 * 32,   # 200k steps * batch_size = total_nimg
+        total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=32,
         channels=128,
         dropout=0.13,

@@ -207,10 +207,13 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss = loss_fn(model=ddp, images=images, labels=labels.to(device))
-                loss = loss.mean().mul(loss_scaling)
-                training_stats.report('Loss/loss', loss)
-                step_stats.loss += loss.item()
+
+                raw_loss = loss_fn(model=ddp, images=images, labels=labels.to(device))
+
+                training_stats.report('Loss/loss', raw_loss)
+                step_stats.loss += raw_loss.item() / num_accumulation_rounds
+
+                loss = raw_loss * (loss_scaling / num_accumulation_rounds)
                 loss.backward()
 
         # Run optimizer and update weights.
@@ -222,20 +225,19 @@ def training_loop(
             for param in model.parameters():
                 if param.grad is not None:
                     torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
-
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
-        clip_coef = min(1.0, max_clip_norm / (grad_norm.item() + 1e-12))
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
 
         optimizer.step()
 
-        step_stats.loss /= num_accumulation_rounds
         step_stats.grad_norm = grad_norm.item()
-        step_stats.clip_coef = clip_coef
 
         # Update EMA and training state.
         state.cur_nimg += batch_size
         if ema is not None:
             ema.update(cur_nimg=state.cur_nimg, batch_size=batch_size)
         cumulative_training_time += time.time() - batch_start_time
+
+    if wandb_run is not None:
+        wandb.finish()
 
 #----------------------------------------------------------------------------
