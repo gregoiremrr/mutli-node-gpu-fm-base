@@ -233,10 +233,13 @@ def training_loop(
 
         # Clip
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
+        clip_coef = min(1.0, max_clip_norm / (grad_norm.item() + 1e-12))
 
         optimizer.step()
 
+        step_stats.lr = lr
         step_stats.grad_norm = grad_norm.item()
+        step_stats.clip_coef = clip_coef
 
         # Update EMA and training state.
         state.cur_nimg += batch_size
