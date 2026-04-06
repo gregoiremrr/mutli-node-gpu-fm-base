@@ -18,7 +18,7 @@ config_presets = {
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=32,
         channels=128,
-        dropout=0.13,
+        dropout=0.0,
         lr=1e-3,
         max_clip_norm=1
     )

@@ -226,7 +226,7 @@ def training_loop(
         inv_scale = 1 / loss_scaling
         for param in model.parameters():
             if param.grad is not None:
-                param.grad.mul_(inv_scale) # In-place multiplication
+                param.grad.mul_(inv_scale)
                 
                 if force_finite:
                     torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
