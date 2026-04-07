@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only
 config_presets = {
     'fm-cifar10': dnnlib.EasyDict(
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
-        batch_size=32,
+        batch_size=256,
         channels=128,
         dropout=0.0,
         lr=1e-3,
@@ -50,9 +50,9 @@ def setup_training_config(preset='fm-cifar10', **opts):
         raise click.ClickException(f'--data: {err}')
     c.data_loader_kwargs = dict(
         class_name='torch.utils.data.DataLoader',
-        pin_memory=True,
-        num_workers=2,
-        prefetch_factor=2
+        pin_memory=opts.pin_memory,
+        num_workers=opts.num_workers,
+        prefetch_factor=opts.prefetch_factor
     )
 
     # Encoder.
@@ -107,12 +107,13 @@ def setup_training_config(preset='fm-cifar10', **opts):
 #----------------------------------------------------------------------------
 # Print training configuration.
 
-def print_training_config(run_dir, c):
+def print_training_config(run_dir, pretrained_pkl, c):
     dist.print0()
     dist.print0('Training config:')
     dist.print0(json.dumps(c, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {run_dir}')
+    dist.print0(f'Pretrained model:        {pretrained_pkl}')
     dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
@@ -123,7 +124,7 @@ def print_training_config(run_dir, c):
 #----------------------------------------------------------------------------
 # Launch training.
 
-def launch_training(run_dir, c):
+def launch_training(run_dir, pretrained_pkl, c):
     if dist.get_rank() == 0 and not os.path.isdir(run_dir):
         dist.print0('Creating output directory...')
         os.makedirs(run_dir)
@@ -132,7 +133,7 @@ def launch_training(run_dir, c):
 
     torch.distributed.barrier()
     dnnlib.util.Logger(file_name=os.path.join(run_dir, 'log.txt'), file_mode='a', should_flush=True)
-    training.training_loop.training_loop(run_dir=run_dir, **c)
+    training.training_loop.training_loop(run_dir=run_dir, pretrained_pkl=pretrained_pkl, **c)
 
 #----------------------------------------------------------------------------
 # Parse an integer with optional power-of-two suffix:
@@ -159,12 +160,13 @@ def parse_nimg(s):
 # Main options.
 @click.option('--outdir',           help='Output directory (resumed if exists with checkpoints)', metavar='DIR', type=str, required=True)
 @click.option('--data',             help='Path to the dataset', metavar='ZIP|DIR',              type=str, required=True)
+@click.option('--pretrained-pkl',   help='Pretrained snapshot path', metavar='DIR', type=str,   default=None)
 @click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=True, show_default=True)
 @click.option('--preset',           help='Configuration preset', metavar='STR',                 type=str, default='fm-cifar10', show_default=True)
 
 # Hyperparameters. (all the things in the preset)
 @click.option('--total_nimg',       help='Training duration', metavar='NIMG',                   type=parse_nimg, default=None)
-@click.option('--batch-size',            help='Total batch size', metavar='NIMG',                    type=parse_nimg, default=None)
+@click.option('--batch-size',       help='Total batch size', metavar='NIMG',                    type=parse_nimg, default=None)
 @click.option('--channels',         help='Channel multiplier', metavar='INT',                   type=click.IntRange(min=64), default=None)
 @click.option('--dropout',          help='Dropout probability', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=None)
 @click.option('--lr',               help='Learning rate max. (alpha_ref)', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)
@@ -173,8 +175,8 @@ def parse_nimg(s):
 # Performance-related options.
 @click.option('--max-batch-gpu',    help='Limit batch size per GPU', metavar='NIMG',            type=parse_nimg, default=None, show_default=True)
 @click.option('--pin-memory',       help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
-@click.option('--num-workers',      help='Number of workers in the dataloader', metavar='BOOL', default=True, show_default=True)
-@click.option('--prefetch_factor',  help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
+@click.option('--num-workers',      help='Number of workers in the dataloader', metavar='INT',  type=int, default=2, show_default=True)
+@click.option('--prefetch_factor',  help='Number of batches for each worker', metavar='INT',    type=int, default=2, show_default=True)
 @click.option('--fp16/--no-fp16',   help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
 @click.option('--ls',               help='Loss scaling', metavar='FLOAT',                       type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',            help='Enable cuDNN benchmarking', metavar='BOOL',           type=bool, default=True, show_default=True)
@@ -186,7 +188,8 @@ def parse_nimg(s):
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 
-def cmdline(outdir, dry_run, **opts):
+
+def cmdline(outdir, pretrained_pkl, dry_run, **opts):
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
     dist.print0('Setting up training config...')
@@ -197,6 +200,9 @@ def cmdline(outdir, dry_run, **opts):
     if os.path.isdir(outdir) and any(f.startswith('training-state-') for f in os.listdir(outdir)):
         run_dir = outdir
         dist.print0(f'Resuming from {run_dir}')
+
+        if pretrained_pkl:
+            raise click.ClickException('Cannot use --pretrained when resuming from an existing run')
     else:
         now = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
         if dist.get_world_size() > 1:
@@ -210,11 +216,11 @@ def cmdline(outdir, dry_run, **opts):
         preset_name = opts.get('preset', 'run')
         run_dir = os.path.join(outdir, f'{now}_{preset_name}')
 
-    print_training_config(run_dir=run_dir, c=c)
+    print_training_config(run_dir=run_dir, pretrained_pkl=pretrained_pkl, c=c)
     if dry_run:
         dist.print0('Dry run; exiting.')
     else:
-        launch_training(run_dir=run_dir, c=c)
+        launch_training(run_dir=run_dir, pretrained_pkl=pretrained_pkl, c=c)
     torch.distributed.destroy_process_group()
 
 #----------------------------------------------------------------------------

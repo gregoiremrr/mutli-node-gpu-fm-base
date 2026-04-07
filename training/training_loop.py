@@ -24,6 +24,7 @@ def training_loop(
     optimizer_kwargs,
     lr_kwargs,
     ema_kwargs,
+    pretrained_pkl,
     max_clip_norm,
 
     run_dir,                # Output directory.
@@ -64,25 +65,39 @@ def training_loop(
     assert snapshot_nimg is None or snapshot_nimg % batch_size == 0
     assert checkpoint_nimg is None or checkpoint_nimg % batch_size == 0
 
-    # Setup dataset, encoder, and network.
+    # Setup dataset and encoder.
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     ref_image, ref_label = dataset_obj[0]
     dist.print0('Setting up encoder...')
     encoder = dnnlib.util.construct_class_by_name(**encoder_kwargs)
     ref_image = encoder.encode_latents(torch.as_tensor(ref_image).to(device).unsqueeze(0))
+
+    # Setup the model, eventually loading the network.
     dist.print0('Constructing model...')
-    interface_kwargs = dict(img_resolution=ref_image.shape[-1], img_channels=ref_image.shape[1], label_dim=ref_label.shape[-1])
+    interface_kwargs = dict(
+        img_resolution=ref_image.shape[-1],
+        img_channels=ref_image.shape[1],
+        label_dim=ref_label.shape[-1]
+    )
     model = dnnlib.util.construct_class_by_name(**model_kwargs, **interface_kwargs)
+    if pretrained_pkl is not None:
+        dist.print0(f'Loading pretrained weights from {pretrained_pkl}...')
+        with open(pretrained_pkl, 'rb') as f:
+            data = pickle.load(f)
+        # data.ema is the saved model
+        misc.copy_params_and_buffers(src_module=data.ema, dst_module=model, require_all=False)
+        del data
     model.train().requires_grad_(True).to(device)
 
     # Print network summary.
     if dist.get_rank() == 0:
-        misc.print_module_summary(model, [
-            torch.zeros([batch_gpu, model.img_channels, model.img_resolution, model.img_resolution], device=device),
-            torch.ones([batch_gpu], device=device),
-            torch.zeros([batch_gpu, model.label_dim], device=device),
-        ], max_nesting=2)
+        with torch.no_grad():
+            misc.print_module_summary(model, [
+                torch.zeros([batch_gpu, model.img_channels, model.img_resolution, model.img_resolution], device=device),
+                torch.ones([batch_gpu], device=device),
+                torch.zeros([batch_gpu, model.label_dim], device=device),
+            ], max_nesting=2)
 
     # Setup training state.
     dist.print0('Setting up training state...')
@@ -93,7 +108,13 @@ def training_loop(
     ema = dnnlib.util.construct_class_by_name(model=model, **ema_kwargs) if ema_kwargs is not None else None
 
     # Load previous checkpoint and decide how long to train.
-    checkpoint = dist.CheckpointIO(state=state, model=model, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
+    checkpoint = dist.CheckpointIO(
+        state=state,
+        model=model,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        ema=ema
+    )
     checkpoint.load_latest(run_dir)
     assert total_nimg > state.cur_nimg
     dist.print0(f'Training from {state.cur_nimg // 1000} kimg to {total_nimg // 1000} kimg:')
@@ -112,13 +133,27 @@ def training_loop(
         )
 
     # Main training loop.
-    dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed, start_idx=state.cur_nimg)
-    dataset_iterator = iter(dnnlib.util.construct_class_by_name(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+    dataset_sampler = misc.InfiniteSampler(
+        dataset=dataset_obj,
+        rank=dist.get_rank(),
+        num_replicas=dist.get_world_size(),
+        seed=seed,
+        start_idx=state.cur_nimg
+    )
+    dataset_iterator = iter(
+        dnnlib.util.construct_class_by_name(
+            dataset=dataset_obj,
+            sampler=dataset_sampler,
+            batch_size=batch_gpu,
+            **data_loader_kwargs
+        )
+    )
     prev_status_nimg = state.cur_nimg
     cumulative_training_time = 0
     start_nimg = state.cur_nimg
     stats_jsonl = None
     step_stats = dnnlib.EasyDict()
+
     while True:
         done = (state.cur_nimg >= total_nimg)
 
@@ -227,7 +262,7 @@ def training_loop(
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(inv_scale)
-                
+
                 if force_finite:
                     torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
 
