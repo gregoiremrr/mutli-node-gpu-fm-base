@@ -33,7 +33,7 @@ def training_loop(
     max_batch_gpu,          # Limit batch size per GPU. None = no limit.
     total_nimg,             # Train for a total of N training images.
     status_nimg,            # Report status every N training images. None = disable.
-    snapshot_nimg,          # Save network snapshot every N training images. None = disable.
+    snapshot_nimg,          # Save model snapshot every N training images. None = disable.
     checkpoint_nimg,        # Save state checkpoint every N training images. None = disable.
 
     loss_scaling,           # Loss scaling factor for reducing FP16 under/overflows.
@@ -73,7 +73,7 @@ def training_loop(
     encoder = dnnlib.util.construct_class_by_name(**encoder_kwargs)
     ref_image = encoder.encode_latents(torch.as_tensor(ref_image).to(device).unsqueeze(0))
 
-    # Setup the model, eventually loading the network.
+    # Setup the model, eventually loading the model.
     dist.print0('Constructing model...')
     interface_kwargs = dict(
         img_resolution=ref_image.shape[-1],
@@ -210,14 +210,14 @@ def training_loop(
             if dist.should_stop() or dist.should_suspend():
                 done = True
 
-        # Save network snapshot.
+        # Save model snapshot.
         if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
             ema_list = ema.get() if ema is not None else optimizer.get_ema(model) if hasattr(optimizer, 'get_ema') else model
             ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
             for ema_model, ema_suffix in ema_list:
                 data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs, loss_fn=loss_fn)
                 data.ema = copy.deepcopy(ema_model).cpu().eval().requires_grad_(False).to(torch.float16)
-                fname = f'network-snapshot-{state.cur_nimg//1000:07d}{ema_suffix}.pkl'
+                fname = f'model-snapshot-{state.cur_nimg//1000:07d}{ema_suffix}.pkl'
                 dist.print0(f'Saving {fname} ... ', end='', flush=True)
                 with open(os.path.join(run_dir, fname), 'wb') as f:
                     pickle.dump(data, f)
