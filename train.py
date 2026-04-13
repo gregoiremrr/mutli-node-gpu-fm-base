@@ -17,6 +17,16 @@ config_presets = {
     'fm-cifar10': dnnlib.EasyDict(
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
+        pred="v",
+        channels=128,
+        dropout=0.0,
+        lr=1e-3,
+        max_clip_norm=1
+    ),
+    'fm-cifar10-xpred': dnnlib.EasyDict(
+        total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
+        batch_size=256,
+        pred="x",
         channels=128,
         dropout=0.0,
         lr=1e-3,
@@ -68,6 +78,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
     c.batch_size=opts.batch_size
     c.model_kwargs = dnnlib.EasyDict(
         class_name='training.model.FlowMatchingModel',
+        pred=opts.pred,
         sigma_data=0.5,
         net_kwargs=dnnlib.EasyDict(
             class_name='training.networks.SongUNet',
@@ -164,9 +175,10 @@ def parse_nimg(s):
 @click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=True, show_default=True)
 @click.option('--preset',           help='Configuration preset', metavar='STR',                 type=str, default='fm-cifar10', show_default=True)
 
-# Hyperparameters. (all the things in the preset)
+# Hyperparameters. (should be None by default and be configured in the presets)
 @click.option('--total_nimg',       help='Training duration', metavar='NIMG',                   type=parse_nimg, default=None)
 @click.option('--batch-size',       help='Total batch size', metavar='NIMG',                    type=parse_nimg, default=None)
+@click.option('--pred',             help='Quantity predicted by the network', metavar='x/v',    type=str, default=None)
 @click.option('--channels',         help='Channel multiplier', metavar='INT',                   type=click.IntRange(min=64), default=None)
 @click.option('--dropout',          help='Dropout probability', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=None)
 @click.option('--lr',               help='Learning rate max. (alpha_ref)', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)

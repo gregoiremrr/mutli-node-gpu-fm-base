@@ -8,14 +8,14 @@ import dnnlib
 class FlowMatchingModel(torch.nn.Module):
     def __init__(
         self,
+        pred,
         img_resolution,
         img_channels,
+        sigma_data,
         label_dim=0,
-        sigma_data=0.5,
-        eps=1e-5,
+        eps=0.05,
         use_fp16=False,
-        net_kwargs=None,
-        pred="v"
+        net_kwargs=None
     ):
         assert pred in ["x", "v"]
         super().__init__()
@@ -66,10 +66,17 @@ class FlowMatchingModel(torch.nn.Module):
             for i in range(n_steps):
                 t = torch.full([n_samples], i * dt, device=device)
                 k1 = self(x, t, class_labels=class_labels)
-                x_pred = x + dt * k1
-                t_next = torch.full([n_samples], (i + 1) * dt, device=device)
-                k2 = self(x_pred, t_next, class_labels=class_labels)
-                x = x + 0.5 * dt * (k1 + k2)
+                
+                # Check if we are on the final step
+                if i == n_steps - 1 and self.pred == "x":
+                    # Use a standard Euler step to avoid evaluating at t=1.0
+                    x = x + dt * k1
+                else:
+                    # Standard Heun correction step
+                    x_pred = x + dt * k1
+                    t_next = torch.full([n_samples], (i + 1) * dt, device=device)
+                    k2 = self(x_pred, t_next, class_labels=class_labels)
+                    x = x + 0.5 * dt * (k1 + k2)
 
         return x
 
