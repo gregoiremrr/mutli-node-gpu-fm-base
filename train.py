@@ -18,6 +18,7 @@ config_presets = {
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
         pred="v",
+        t_scale=1000,
         p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
@@ -28,6 +29,7 @@ config_presets = {
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
         pred="x",
+        t_scale=1000,
         p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
@@ -82,6 +84,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
         class_name='training.model.FlowMatchingModel',
         pred=opts.pred,
         sigma_data=0.5,
+        t_scale=opts.t_scale,
         net_kwargs=dnnlib.EasyDict(
             class_name='training.networks.SongUNet',
             embedding_type='positional',
@@ -183,6 +186,7 @@ def parse_nimg(s):
 @click.option('--pred',             help='Quantity predicted by the network', metavar='x/v',    type=str, default=None)
 @click.option('--channels',         help='Channel multiplier', metavar='INT',                   type=click.IntRange(min=64), default=None)
 @click.option('--dropout',          help='Dropout probability', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=None)
+@click.option('--t-scale',          help='Scaling for the t embedding', metavar='FLOAT',        type=click.FloatRange(min=0, min_open=True), default=None)
 @click.option('--lr',               help='Learning rate max. (alpha_ref)', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)
 @click.option('--max_clip_norm',    help='Max gradient norm for clipping', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)
 

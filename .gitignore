@@ -8,6 +8,8 @@ training/__pycache__/
 # Folders to keep clean in the git
 datasets/*
 training-runs/*
+out/*
+fid-refs/*
 
 # Keep the previous folders empty
 !**/.gitkeep

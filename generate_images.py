@@ -27,8 +27,12 @@ warnings.filterwarnings('ignore', '1Torch was not compiled with flash attention'
 # Configuration presets.
 
 config_presets = {
-    'edm2-img512-xs-fid':              dnnlib.EasyDict(net='edm2-img512-xs-2147483-0.135.pkl'),      # fid = 3.53
-    'edm2-img512-xs-dino':             dnnlib.EasyDict(net='edm2-img512-xs-2147483-0.200.pkl'),      # fd_dinov2 = 103.39
+    'classic-cifar-10': dnnlib.EasyDict(
+        model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
+        sampler_fn="training.model.sample",
+        n_sampling_steps=10,
+        guidance=1.0
+    ),
 }
 
 #----------------------------------------------------------------------------
@@ -56,17 +60,24 @@ class StackedRandomGenerator:
 # Returns an iterable that yields
 # dnnlib.EasyDict(images, labels, noise, batch_idx, num_batches, indices, seeds)
 
+@torch.inference_mode()
 def generate_images(
-    model,                                      # Main model. Path, URL, or torch.nn.Module.
+    # OS and seeds.
     outdir              = None,                 # Where to save the output images. None = do not save.
     subdirs             = False,                # Create subdirectory for every 1000 seeds?
-    n_steps             = 30,                   # Number of steps during sampling
-    guidance            = 1.0,                  # CFG coef
     seeds               = range(16, 24),        # List of random seeds.
+
+    # Sampling parameters.
+    model               = None,                 # Main model. Path, URL, or torch.nn.Module.
+    sampler_fn          = None,                 # Sampler function for the model.
+    n_sampling_steps    = 30,                   # Number of steps during sampling
+    guidance            = 1.0,                  # CFG coef
     class_idx           = None,                 # Class label. None = select randomly.
+    encoder             = None,                 # Instance of training.encoders.Encoder. None = load from network pickle.
+
+    # Performance options and verbose. 
     max_batch_size      = 32,                   # Maximum batch size for the diffusion model.
     encoder_batch_size  = 4,                    # Maximum batch size for the encoder. None = default.
-    encoder             = None,                 # Instance of training.encoders.Encoder. None = load from network pickle.
     device              = torch.device('cuda'), # Which compute device to use.
     verbose             = True,                 # Enable status prints?
 ):
@@ -81,6 +92,10 @@ def generate_images(
         with dnnlib.util.open_url(model, verbose=(verbose and dist.get_rank() == 0)) as f:
             data = pickle.load(f)
         model = data['ema'].to(device)
+
+        model.eval()
+        model.requires_grad_(False)
+
         if encoder is None:
             encoder = data.get('encoder', None)
             if encoder is None:
@@ -128,8 +143,15 @@ def generate_images(
                             r.labels[:, class_idx] = 1
 
                     # Generate images.
-                    #latents = dnnlib.util.call_func_by_name(func_name=sampler_fn, model=model, noise=r.noise, labels=r.labels, randn_like=rnd.randn_like, **sampler_kwargs)
-                    latents = model.sample(r.labels, len(r.seeds), n_steps, device, guidance, noise=r.noise)
+                    latents = dnnlib.util.call_func_by_name(
+                        func_name=sampler_fn,
+                        model=model,
+                        noise=r.noise,
+                        labels=r.labels,
+                        n_steps=n_sampling_steps,
+                        n_samples=len(r.seeds),
+                        guidance=guidance,
+                    )
                     r.images = encoder.decode(latents)
 
                     # Save images.
@@ -166,23 +188,20 @@ def parse_int_list(s):
 # Command line interface.
 
 @click.command()
-@click.option('--preset',                   help='Configuration preset', metavar='STR',                             type=str, default=None)
-@click.option('--net',                      help='Main network pickle filename', metavar='PATH|URL',                type=str, default=None)
 @click.option('--outdir',                   help='Where to save the output images', metavar='DIR',                  type=str, required=True)
 @click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
 @click.option('--seeds',                    help='List of random seeds (e.g. 1,2,5-10)', metavar='LIST',            type=parse_int_list, default='16-19', show_default=True)
-@click.option('--class', 'class_idx',       help='Class label  [default: random]', metavar='INT',                   type=click.IntRange(min=0), default=None)
-@click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=32, show_default=True)
 
-@click.option('--steps', 'n_steps',         help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=32, show_default=True)
-@click.option('--sigma_min',                help='Lowest noise level', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
-@click.option('--sigma_max',                help='Highest noise level', metavar='FLOAT',                            type=click.FloatRange(min=0, min_open=True), default=80, show_default=True)
-@click.option('--rho',                      help='Time step exponent', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
-@click.option('--guidance',                 help='Guidance strength  [default: 1; no guidance]', metavar='FLOAT',   type=float, default=None)
-@click.option('--S_churn', 'S_churn',       help='Stochasticity strength', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_min', 'S_min',           help='Stoch. min noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_max', 'S_max',           help='Stoch. max noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default='inf', show_default=True)
-@click.option('--S_noise', 'S_noise',       help='Stoch. noise inflation', metavar='FLOAT',                         type=float, default=1, show_default=True)
+@click.option('--preset',                   help='Configuration preset', metavar='STR',                             type=str, default=None)
+@click.option('--model',                    help='Main model pickle filename', metavar='PATH|URL',                  type=str, default=None)
+@click.option('--sampler-fn',               help='Sampler function for the model', metavar='FUNC',                  type=str, default=None)
+@click.option('--n-sampling-steps',         help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=32, show_default=True)
+@click.option('--guidance',                 help='Guidance strength  [default: 1; no guidance]', metavar='FLOAT',   type=float, default=1.0)
+@click.option('--class', 'class_idx',       help='Class label  [default: random]', metavar='INT',                   type=click.IntRange(min=0), default=None)
+
+@click.option('--max-batch-size',           help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=32, show_default=True)
+@click.option('--encoder-batch-size',       help='Maximum batch size for the encoder', metavar='INT',               type=click.IntRange(min=1), default=None, show_default=True)
+
 
 def cmdline(preset, **opts):
     """Generate random images using the given model.
@@ -209,8 +228,8 @@ def cmdline(preset, **opts):
                 opts[key] = value
 
     # Validate options.
-    if opts.net is None:
-        raise click.ClickException('Please specify either --preset or --net')
+    if opts.model is None:
+        raise click.ClickException('Please specify either --preset or --model')
     if opts.guidance is None or opts.guidance == 1:
         opts.guidance = 1
 
@@ -218,7 +237,7 @@ def cmdline(preset, **opts):
     dist.init()
     image_iter = generate_images(**opts)
     for _r in tqdm.tqdm(image_iter, unit='batch', disable=(dist.get_rank() != 0)):
-        pass
+        del _r
 
 #----------------------------------------------------------------------------
 

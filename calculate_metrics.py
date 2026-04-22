@@ -19,7 +19,6 @@ import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import misc
 from training import dataset
-import generate_images
 
 #----------------------------------------------------------------------------
 # Abstract base class for feature detectors.
@@ -41,6 +40,7 @@ class InceptionV3Detector(Detector):
         url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
         with dnnlib.util.open_url(url, verbose=False) as f:
             self.model = pickle.load(f)
+        self.model.eval().requires_grad_(False)
 
     def __call__(self, x):
         return self.model.to(x.device)(x, return_features=True)
@@ -172,35 +172,36 @@ def calculate_stats_for_iterable(
                 s.cum_sigma = torch.zeros([s.detector.feature_dim, s.detector.feature_dim], dtype=torch.float64, device=device)
             cum_images = torch.zeros([], dtype=torch.int64, device=device)
 
-            # Loop over batches.
-            for batch_idx, images in enumerate(image_iter):
-                if isinstance(images, dict) and 'images' in images: # dict(images)
-                    images = images['images']
-                elif isinstance(images, (tuple, list)) and len(images) == 2: # (images, labels)
-                    images = images[0]
-                images = torch.as_tensor(images).to(device)
+            with torch.inference_mode():
+                # Loop over batches.
+                for batch_idx, images in enumerate(image_iter):
+                    if isinstance(images, dict) and 'images' in images: # dict(images)
+                        images = images['images']
+                    elif isinstance(images, (tuple, list)) and len(images) == 2: # (images, labels)
+                        images = images[0]
+                    images = torch.as_tensor(images).to(device)
 
-                # Accumulate statistics.
-                if images is not None:
-                    for s in state:
-                        features = s.detector(images).to(torch.float64)
-                        s.cum_mu += features.sum(0)
-                        s.cum_sigma += features.T @ features
-                    cum_images += images.shape[0]
+                    # Accumulate statistics.
+                    if images is not None:
+                        for s in state:
+                            features = s.detector(images).to(torch.float64)
+                            s.cum_mu += features.sum(0)
+                            s.cum_sigma += features.T @ features
+                        cum_images += images.shape[0]
 
-                # Output results.
-                r = dnnlib.EasyDict(stats=None, images=images, batch_idx=batch_idx, num_batches=num_batches)
-                r.num_images = int(all_reduce(cum_images).cpu())
-                if batch_idx == num_batches - 1:
-                    assert r.num_images >= 2
-                    r.stats = dict(num_images=r.num_images)
-                    for s in state:
-                        mu = all_reduce(s.cum_mu) / r.num_images
-                        sigma = (all_reduce(s.cum_sigma) - mu.ger(mu) * r.num_images) / (r.num_images - 1)
-                        r.stats[s.metric] = dict(mu=mu.cpu().numpy(), sigma=sigma.cpu().numpy())
-                    if dest_path is not None and dist.get_rank() == 0:
-                        save_stats(stats=r.stats, path=dest_path, verbose=False)
-                yield r
+                    # Output results.
+                    r = dnnlib.EasyDict(stats=None, images=images, batch_idx=batch_idx, num_batches=num_batches)
+                    r.num_images = int(all_reduce(cum_images).cpu())
+                    if batch_idx == num_batches - 1:
+                        assert r.num_images >= 2
+                        r.stats = dict(num_images=r.num_images)
+                        for s in state:
+                            mu = all_reduce(s.cum_mu) / r.num_images
+                            sigma = (all_reduce(s.cum_sigma) - mu.ger(mu) * r.num_images) / (r.num_images - 1)
+                            r.stats[s.metric] = dict(mu=mu.cpu().numpy(), sigma=sigma.cpu().numpy())
+                        if dest_path is not None and dist.get_rank() == 0:
+                            save_stats(stats=r.stats, path=dest_path, verbose=False)
+                    yield r
 
     return StatsIterable()
 
@@ -302,13 +303,6 @@ def cmdline():
         --ref=https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/img512.pkl
 
     \b
-    # Calculate metrics directly for a given model without saving any images
-    torchrun --standalone --nproc_per_node=8 calculate_metrics.py gen \\
-        --net=https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img512-s-2147483-0.130.pkl \\
-        --ref=https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/img512.pkl \\
-        --seed=123456789
-
-    \b
     # Compute dataset reference statistics
     python calculate_metrics.py ref --data=datasets/my-dataset.zip \\
         --dest=fid-refs/my-dataset.pkl
@@ -323,7 +317,7 @@ def cmdline():
 @click.option('--metrics',                  help='List of metrics to compute', metavar='LIST',              type=parse_metric_list, default='fid,fd_dinov2', show_default=True)
 @click.option('--num', 'num_images',        help='Number of images to use', metavar='INT',                  type=click.IntRange(min=2), default=50000, show_default=True)
 @click.option('--seed',                     help='Random seed for selecting the images', metavar='INT',     type=int, default=0, show_default=True)
-@click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                       type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--max-batch-size',           help='Maximum batch size', metavar='INT',                       type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--workers', 'num_workers',   help='Subprocesses to use for data loading', metavar='INT',     type=click.IntRange(min=0), default=2, show_default=True)
 
 def calc(ref_path, metrics, **opts):
@@ -340,37 +334,13 @@ def calc(ref_path, metrics, **opts):
     torch.distributed.barrier()
 
 #----------------------------------------------------------------------------
-# 'gen' subcommand.
-
-@cmdline.command()
-@click.option('--net',                      help='Network pickle filename', metavar='PATH|URL',             type=str, required=True)
-@click.option('--ref', 'ref_path',          help='Dataset reference statistics ', metavar='PKL|NPZ|URL',    type=str, required=True)
-@click.option('--metrics',                  help='List of metrics to compute', metavar='LIST',              type=parse_metric_list, default='fid,fd_dinov2', show_default=True)
-@click.option('--num', 'num_images',        help='Number of images to generate', metavar='INT',             type=click.IntRange(min=2), default=50000, show_default=True)
-@click.option('--seed',                     help='Random seed for the first image', metavar='INT',          type=int, default=0, show_default=True)
-@click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                       type=click.IntRange(min=1), default=32, show_default=True)
-
-def gen(net, ref_path, metrics, num_images, seed, **opts):
-    """Calculate metrics for a given model using default sampler settings."""
-    dist.init()
-    if dist.get_rank() == 0:
-        ref = load_stats(path=ref_path) # do this first, just in case it fails
-    image_iter = generate_images.generate_images(net=net, seeds=range(seed, seed + num_images), **opts)
-    stats_iter = calculate_stats_for_iterable(image_iter, metrics=metrics)
-    for r in tqdm.tqdm(stats_iter, unit='batch', disable=(dist.get_rank() != 0)):
-        pass
-    if dist.get_rank() == 0:
-        calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
-    torch.distributed.barrier()
-
-#----------------------------------------------------------------------------
 # 'ref' subcommand.
 
 @cmdline.command()
 @click.option('--data', 'image_path',       help='Path to the dataset', metavar='PATH|ZIP',             type=str, required=True)
 @click.option('--dest', 'dest_path',        help='Destination file', metavar='PKL',                     type=str, required=True)
 @click.option('--metrics',                  help='List of metrics to compute', metavar='LIST',          type=parse_metric_list, default='fid,fd_dinov2', show_default=True)
-@click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                   type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--max-batch-size',           help='Maximum batch size', metavar='INT',                   type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--workers', 'num_workers',   help='Subprocesses to use for data loading', metavar='INT', type=click.IntRange(min=0), default=2, show_default=True)
 
 def ref(**opts):
