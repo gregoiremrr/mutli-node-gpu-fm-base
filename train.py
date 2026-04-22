@@ -18,6 +18,7 @@ config_presets = {
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
         pred="v",
+        p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
         lr=1e-3,
@@ -27,6 +28,7 @@ config_presets = {
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
         pred="x",
+        p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
         lr=1e-3,
@@ -94,7 +96,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
         use_fp16 = opts.fp16
     )
     c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA')
-    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss')
+    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss', p_uncond=opts.p_uncond_labels)
     c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.99))
     c.lr_kwargs = dnnlib.EasyDict(
         func_name='training.schedulers.cosine_lr',

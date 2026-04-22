@@ -25,6 +25,10 @@ class FlowMatchingModel(torch.nn.Module):
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.label_dim = label_dim
+        if label_dim > 0:
+            self.register_buffer('uncond_label', torch.zeros([1, label_dim]))
+        else:
+            self.uncond_label = None
         self.net = dnnlib.util.construct_class_by_name(
             img_resolution=img_resolution,
             in_channels=img_channels,
@@ -54,28 +58,59 @@ class FlowMatchingModel(torch.nn.Module):
             t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
             v_pred = (pred - xt) / (1 - t_broad).clamp(min=self.eps)
             return v_pred
-
-    def sample(self, class_labels, n_samples, n_steps, device):
+    
+    def sample(self, class_labels, n_samples, n_steps, device, guidance=1.0, noise=None):
+        """
+        Sample from the model using a 2nd-order Heun solver with CFG support.
+        
+        Args:
+            class_labels: The conditional labels (Tensor).
+            n_samples: Number of samples to generate.
+            n_steps: Number of discretization steps.
+            device: Torch device.
+            guidance: CFG scale (1.0 means no guidance).
+        """
         dt = 1.0 / n_steps
-        x = torch.randn(
-            n_samples, self.img_channels, self.img_resolution, self.img_resolution,
-            device=device
-        ) * self.sigma_data
+        if noise is None:
+            x = torch.randn(
+                n_samples, self.img_channels, self.img_resolution, self.img_resolution,
+                device=device
+            ) * self.sigma_data
+        else:
+            x = noise * self.sigma_data
+
+        def get_guided_v(xt, t_cur, labels):
+            if guidance == 1.0 or self.uncond_label is None:
+                return self(xt, t_cur, class_labels=labels)
+
+            # Batch the conditional and unconditional passes together for efficiency
+            # Double the batch size: [conditional_batch, unconditional_batch]
+            xt_combined = torch.cat([xt, xt], dim=0)
+            t_combined = torch.cat([t_cur, t_cur], dim=0)
+            l_combined = torch.cat([labels, self.uncond_label], dim=0)
+
+            v_combined = self(xt_combined, t_combined, class_labels=l_combined)
+            v_cond, v_uncond = v_combined.chunk(2)
+
+            return torch.lerp(v_uncond, v_cond, guidance)
 
         with torch.no_grad():
             for i in range(n_steps):
                 t = torch.full([n_samples], i * dt, device=device)
-                k1 = self(x, t, class_labels=class_labels)
                 
-                # Check if we are on the final step
+                # First evaluation (k1)
+                k1 = get_guided_v(x, t, class_labels)
+                
+                # Check if we are on the final step and predicting x to avoid t=1.0 singularity
                 if i == n_steps - 1 and self.pred == "x":
-                    # Use a standard Euler step to avoid evaluating at t=1.0
                     x = x + dt * k1
                 else:
-                    # Standard Heun correction step
+                    # Standard Heun correction (2nd order)
                     x_pred = x + dt * k1
                     t_next = torch.full([n_samples], (i + 1) * dt, device=device)
-                    k2 = self(x_pred, t_next, class_labels=class_labels)
+                    
+                    # Second evaluation (k2)
+                    k2 = get_guided_v(x_pred, t_next, class_labels)
                     x = x + 0.5 * dt * (k1 + k2)
 
         return x
