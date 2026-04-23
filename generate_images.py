@@ -27,10 +27,34 @@ warnings.filterwarnings('ignore', '1Torch was not compiled with flash attention'
 # Configuration presets.
 
 config_presets = {
-    'classic-cifar-10': dnnlib.EasyDict(
+    'classic-cifar-10-30steps': dnnlib.EasyDict(
+        model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
+        sampler_fn="training.model.sample",
+        n_sampling_steps=30,
+        guidance=1.0
+    ),
+    'classic-cifar-10-20steps': dnnlib.EasyDict(
+        model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
+        sampler_fn="training.model.sample",
+        n_sampling_steps=20,
+        guidance=1.0
+    ),
+    'classic-cifar-10-10steps': dnnlib.EasyDict(
         model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
         sampler_fn="training.model.sample",
         n_sampling_steps=10,
+        guidance=1.0
+    ),
+    'classic-cifar-10-5steps': dnnlib.EasyDict(
+        model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
+        sampler_fn="training.model.sample",
+        n_sampling_steps=5,
+        guidance=1.0
+    ),
+    'classic-cifar-10-2steps': dnnlib.EasyDict(
+        model='training-runs/cifar10/260407_092329_fm-cifar10/network-snapshot-0012582-0.100.pkl',
+        sampler_fn="training.model.sample",
+        n_sampling_steps=2,
         guidance=1.0
     ),
 }
@@ -195,8 +219,8 @@ def parse_int_list(s):
 @click.option('--preset',                   help='Configuration preset', metavar='STR',                             type=str, default=None)
 @click.option('--model',                    help='Main model pickle filename', metavar='PATH|URL',                  type=str, default=None)
 @click.option('--sampler-fn',               help='Sampler function for the model', metavar='FUNC',                  type=str, default=None)
-@click.option('--n-sampling-steps',         help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=32, show_default=True)
-@click.option('--guidance',                 help='Guidance strength  [default: 1; no guidance]', metavar='FLOAT',   type=float, default=1.0)
+@click.option('--n-sampling-steps',         help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=None)
+@click.option('--guidance',                 help='Guidance strength  [default: 1; no guidance]', metavar='FLOAT',   type=float, default=None)
 @click.option('--class', 'class_idx',       help='Class label  [default: random]', metavar='INT',                   type=click.IntRange(min=0), default=None)
 
 @click.option('--max-batch-size',           help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=32, show_default=True)

@@ -8,6 +8,7 @@
 """Calculate evaluation metrics (FID and FD_DINOv2)."""
 
 import os
+import json
 import click
 import tqdm
 import pickle
@@ -330,7 +331,12 @@ def calc(ref_path, metrics, **opts):
     for r in tqdm.tqdm(stats_iter, unit='batch', disable=(dist.get_rank() != 0)):
         pass
     if dist.get_rank() == 0:
-        calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
+        final_scores = calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
+
+        save_path = os.path.join(opts['image_path'], 'metrics_log.json')
+        with open(save_path, 'w') as f:
+            json.dump(final_scores, f, indent=4)
+
     torch.distributed.barrier()
 
 #----------------------------------------------------------------------------
