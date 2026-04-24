@@ -10,7 +10,7 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
 import wandb
-from training.monitoring import log_to_wandb
+from training import monitoring
 
 #----------------------------------------------------------------------------
 # Main training loop.
@@ -24,6 +24,7 @@ def training_loop(
     optimizer_kwargs,
     lr_kwargs,
     ema_kwargs,
+    sampler_kwargs,
     pretrained_pkl,
     max_clip_norm,
 
@@ -38,7 +39,7 @@ def training_loop(
 
     loss_scaling,           # Loss scaling factor for reducing FP16 under/overflows.
     cudnn_benchmark,        # Enable torch.backends.cudnn.benchmark?
-    force_finite = True,    # Get rid of NaN/Inf gradients before feeding them to the optimizer.
+    force_finite,           # Get rid of NaN/Inf gradients before feeding them to the optimizer.
 ):
     # Device.
     device = torch.device('cuda')
@@ -101,7 +102,7 @@ def training_loop(
 
     # Setup training state.
     dist.print0('Setting up training state...')
-    state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
+    state = dnnlib.EasyDict(cur_nimg=0, cur_step=0, total_elapsed_time=0)
     ddp = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=model.parameters(), **optimizer_kwargs)
@@ -120,17 +121,19 @@ def training_loop(
     dist.print0(f'Training from {state.cur_nimg // 1000} kimg to {total_nimg // 1000} kimg:')
     dist.print0()
 
-    # Setup WandB
+    # Setup WandB (rank 0 only).
+    wandb_run = None
     if dist.get_rank() == 0:
         if not state.get('wandb_run_id', None):
             state.wandb_run_id = wandb.util.generate_id()
         wandb_run = wandb.init(
-            project="flow-matching",
+            project='flow-matching',
             name=os.path.basename(run_dir),
             dir=run_dir,
             id=state.wandb_run_id,
-            resume="allow"
+            resume='allow',
         )
+        monitoring.setup_wandb_metrics(wandb)
 
     # Main training loop.
     dataset_sampler = misc.InfiniteSampler(
@@ -173,6 +176,8 @@ def training_loop(
                 'gpumem',       f"{training_stats.report0('Resources/peak_gpu_mem_gb',                  torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}",
                 'reserved',     f"{training_stats.report0('Resources/peak_gpu_mem_reserved_gb',         torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}",
             ]))
+            sec_per_tick = cur_time - prev_status_time
+            sec_per_kimg = cumulative_training_time / max(state.cur_nimg - prev_status_nimg, 1) * 1e3
             cumulative_training_time = 0
             prev_status_nimg = state.cur_nimg
             prev_status_time = cur_time
@@ -189,24 +194,48 @@ def training_loop(
                 stats_jsonl.write('{' + ', '.join(items) + '}\n')
                 stats_jsonl.flush()
 
-            # W&B logging.
+            # W&B logging (rank 0 only).
             if wandb_run is not None:
-                log_to_wandb(
-                    wandb=wandb,
-                    state=state,
-                    step_stats=step_stats,
-                    ema=ema,
-                    encoder=encoder,
-                    device=device,
-                    log_samples=True,
-                    n_samples=16,
-                    n_steps=50,
+                grid_np = None
+                if ema is not None:
+                    ema_model = ema.get()
+                    if isinstance(ema_model, list):
+                        ema_model = ema_model[0][0]
+                    ema_model.eval()
+                    grid = monitoring.generate_sample_grid(
+                        ema_model, encoder, sampler_kwargs,
+                        n_samples=16,
+                        label_dim=model.label_dim,
+                        seed=state.cur_step,
+                        device=device,
+                    )
+                    grid_np = grid.permute(1, 2, 0).cpu().numpy()
+
+                main_metrics = {
+                    'loss': step_stats.get('loss', float('nan')),
+                    'lr': step_stats.get('lr', float('nan')),
+                    'grad_norm': step_stats.get('grad_norm', float('nan')),
+                }
+                metrics = {
+                    'clip_coef': step_stats.get('clip_coef', float('nan')),
+                    'sec_per_tick': sec_per_tick,
+                    'sec_per_kimg': sec_per_kimg,
+                }
+                main_plots = {'samples': wandb.Image(grid_np)} if grid_np is not None else None
+
+                monitoring.log_to_wandb(
+                    wandb,
+                    cur_step=state.cur_step,
+                    cur_nimg=state.cur_nimg,
+                    elapsed_time=state.total_elapsed_time,
+                    main_metrics=main_metrics,
+                    metrics=metrics,
+                    main_plots=main_plots,
+                    plots=None,
                 )
 
             # Update progress and check for abort.
             dist.update_progress(state.cur_nimg // 1000, total_nimg // 1000)
-            if state.cur_nimg == total_nimg and state.cur_nimg < total_nimg:
-                dist.request_suspend()
             if dist.should_stop() or dist.should_suspend():
                 done = True
 
@@ -236,7 +265,7 @@ def training_loop(
         # Evaluate loss and accumulate gradients.
         step_stats.loss = 0
         batch_start_time = time.time()
-        misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
+        misc.set_random_seed(seed, dist.get_rank(), state.cur_step)
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
@@ -278,11 +307,12 @@ def training_loop(
 
         # Update EMA and training state.
         state.cur_nimg += batch_size
+        state.cur_step += 1
         if ema is not None:
             ema.update(cur_nimg=state.cur_nimg, batch_size=batch_size)
         cumulative_training_time += time.time() - batch_start_time
 
-    if wandb_run is not None:
+    if dist.get_rank() == 0 and wandb_run is not None:
         wandb.finish()
 
 #----------------------------------------------------------------------------

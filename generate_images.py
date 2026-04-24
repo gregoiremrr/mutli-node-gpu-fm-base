@@ -97,7 +97,7 @@ def generate_images(
     n_sampling_steps    = 30,                   # Number of steps during sampling
     guidance            = 1.0,                  # CFG coef
     class_idx           = None,                 # Class label. None = select randomly.
-    encoder             = None,                 # Instance of training.encoders.Encoder. None = load from network pickle.
+    encoder             = None,                 # Instance of training.encoders.Encoder. None = load from model pickle.
 
     # Performance options and verbose. 
     max_batch_size      = 32,                   # Maximum batch size for the diffusion model.
@@ -112,7 +112,7 @@ def generate_images(
     # Load model.
     if isinstance(model, str):
         if verbose:
-            dist.print0(f'Loading main network from {model} ...')
+            dist.print0(f'Loading main model from {model} ...')
         with dnnlib.util.open_url(model, verbose=(verbose and dist.get_rank() == 0)) as f:
             data = pickle.load(f)
         model = data['ema'].to(device)

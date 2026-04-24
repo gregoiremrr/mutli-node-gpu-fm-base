@@ -11,31 +11,83 @@ import datetime
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
 
 #----------------------------------------------------------------------------
-# Configuration presets.
+# Dataset presets: things intrinsic to the data (network shape,
+# noise scale, sampler used at monitoring time, learning-rate schedule family).
+
+dataset_presets = {
+    'cifar10': dnnlib.EasyDict(
+        sigma_data=0.5,
+        eps=0.05,
+        net_kwargs=dnnlib.EasyDict(
+            class_name='training.networks.SongUNet',
+            embedding_type='positional',
+            encoder_type='standard',
+            decoder_type='standard',
+            channel_mult_noise=1,
+            resample_filter=[1, 1],
+            channel_mult=[2, 2, 2],
+            attn_resolutions=[16],
+        ),
+        sampler_kwargs=dnnlib.EasyDict(
+            func_name='training.model.sample',
+            n_steps=50,
+            guidance=1.0,
+        ),
+        lr_scheduler_kwargs=dnnlib.EasyDict(
+            func_name='training.schedulers.cosine_lr',
+            warmup_nimg=5_000 * 256,
+        ),
+    ),
+}
+
+#----------------------------------------------------------------------------
+# Configuration presets: everything that defines a particular training run on
+# top of a dataset preset (which dataset, conditioning, optimization budget,
+# loss/architecture knobs that we tend to sweep).
 
 config_presets = {
     'fm-cifar10': dnnlib.EasyDict(
+        dataset='cifar10',
+        cond=True,
         total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
         batch_size=256,
-        pred="v",
+        pred='v',
         t_scale=1000,
         p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
         lr=1e-3,
-        max_clip_norm=1
+        max_clip_norm=1.0,
+        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.LinearInterpolant'),
     ),
     'fm-cifar10-xpred': dnnlib.EasyDict(
-        total_nimg=200_000 * 64,   # 200k steps * batch_size = total_nimg
+        dataset='cifar10',
+        cond=True,
+        total_nimg=200_000 * 64,
         batch_size=256,
-        pred="x",
+        pred='x',
         t_scale=1000,
         p_uncond_labels=0.13,
         channels=128,
         dropout=0.0,
         lr=1e-3,
-        max_clip_norm=1
-    )
+        max_clip_norm=1.0,
+        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.LinearInterpolant'),
+    ),
+    'fm-cifar10-trig': dnnlib.EasyDict(
+        dataset='cifar10',
+        cond=True,
+        total_nimg=200_000 * 64,
+        batch_size=256,
+        pred='v',
+        t_scale=1000,
+        p_uncond_labels=0.13,
+        channels=128,
+        dropout=0.0,
+        lr=1e-3,
+        max_clip_norm=1.0,
+        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.TrigInterpolant'),
+    ),
 }
 
 #----------------------------------------------------------------------------
@@ -43,14 +95,32 @@ config_presets = {
 
 def setup_training_config(preset='fm-cifar10', **opts):
     opts = dnnlib.EasyDict(opts)
-    c = dnnlib.EasyDict()
 
-    # Preset.
+    # Resolve presets.
     if preset not in config_presets:
         raise click.ClickException(f'Invalid configuration preset "{preset}"')
-    for key, value in config_presets[preset].items():
+    config_preset = config_presets[preset]
+
+    dataset_name = config_preset['dataset']
+    if dataset_name not in dataset_presets:
+        raise click.ClickException(f'Invalid dataset preset "{dataset_name}"')
+    dataset_preset = dataset_presets[dataset_name]
+
+    # Sanity check: the two preset namespaces must not overlap.
+    overlap = set(config_preset).intersection(dataset_preset)
+    assert not overlap, f'config_preset and dataset_preset share keys: {sorted(overlap)}'
+
+    # Merge presets, then apply CLI overrides (a CLI value of None means "use preset").
+    merged = {**dataset_preset, **config_preset}
+    for key, value in merged.items():
         if opts.get(key, None) is None:
             opts[key] = value
+
+    # Conditional vs unconditional sanity: no label dropout if not class-conditional.
+    if not opts.cond:
+        assert opts.p_uncond_labels == 0, '--p-uncond-labels must be 0 when --cond=False'
+
+    c = dnnlib.EasyDict()
 
     # Dataset and Dataloader.
     c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond)
@@ -78,40 +148,38 @@ def setup_training_config(preset='fm-cifar10', **opts):
         raise click.ClickException(f'--data: Unsupported channel count {dataset_channels}')
 
     # Hyperparameters.
-    c.total_nimg=opts.total_nimg
-    c.batch_size=opts.batch_size
+    c.total_nimg = opts.total_nimg
+    c.batch_size = opts.batch_size
     c.model_kwargs = dnnlib.EasyDict(
         class_name='training.model.FlowMatchingModel',
         pred=opts.pred,
-        sigma_data=0.5,
+        sigma_data=opts.sigma_data,
         t_scale=opts.t_scale,
+        eps=opts.eps,
         net_kwargs=dnnlib.EasyDict(
-            class_name='training.networks.SongUNet',
-            embedding_type='positional',
-            encoder_type='standard',
-            decoder_type='standard',
-            channel_mult_noise=1,
-            resample_filter=[1, 1],
+            **opts.net_kwargs,
             model_channels=opts.channels,
-            channel_mult=[2, 2, 2],
-            dropout=opts.dropout
+            dropout=opts.dropout,
         ),
-        use_fp16 = opts.fp16
+        interpolant_kwargs=dnnlib.EasyDict(**opts.interpolant_kwargs),
+        use_fp16=opts.fp16,
     )
     c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA')
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss', p_uncond=opts.p_uncond_labels)
     c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.99))
     c.lr_kwargs = dnnlib.EasyDict(
-        func_name='training.schedulers.cosine_lr',
+        **opts.lr_scheduler_kwargs,
         base_lr=opts.lr,
-        total_nimg=opts.total_nimg
+        total_nimg=opts.total_nimg,
     )
+    c.sampler_kwargs = dnnlib.EasyDict(**opts.sampler_kwargs)
     c.max_clip_norm = opts.max_clip_norm
 
     # Performance-related options.
     c.max_batch_gpu = opts.max_batch_gpu or None
     c.loss_scaling = opts.ls
     c.cudnn_benchmark = opts.bench
+    c.force_finite = opts.force_finite
 
     # I/O-related options.
     c.status_nimg = opts.status or None
@@ -177,10 +245,10 @@ def parse_nimg(s):
 @click.option('--outdir',           help='Output directory (resumed if exists with checkpoints)', metavar='DIR', type=str, required=True)
 @click.option('--data',             help='Path to the dataset', metavar='ZIP|DIR',              type=str, required=True)
 @click.option('--pretrained-pkl',   help='Pretrained snapshot path', metavar='DIR', type=str,   default=None)
-@click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=True, show_default=True)
 @click.option('--preset',           help='Configuration preset', metavar='STR',                 type=str, default='fm-cifar10', show_default=True)
 
-# Hyperparameters. (should be None by default and be configured in the presets)
+# Hyperparameters. (None by default => use the preset value)
+@click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=None)
 @click.option('--total_nimg',       help='Training duration', metavar='NIMG',                   type=parse_nimg, default=None)
 @click.option('--batch-size',       help='Total batch size', metavar='NIMG',                    type=parse_nimg, default=None)
 @click.option('--pred',             help='Quantity predicted by the network', metavar='x/v',    type=str, default=None)
@@ -189,15 +257,17 @@ def parse_nimg(s):
 @click.option('--t-scale',          help='Scaling for the t embedding', metavar='FLOAT',        type=click.FloatRange(min=0, min_open=True), default=None)
 @click.option('--lr',               help='Learning rate max. (alpha_ref)', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)
 @click.option('--max_clip_norm',    help='Max gradient norm for clipping', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)
+@click.option('--p-uncond-labels',  help='Prob. of dropping labels for CFG training', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=None)
 
 # Performance-related options.
 @click.option('--max-batch-gpu',    help='Limit batch size per GPU', metavar='NIMG',            type=parse_nimg, default=None, show_default=True)
-@click.option('--pin-memory',       help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
+@click.option('--pin-memory',       help='Use pinned memory in the dataloader', metavar='BOOL', default=True, show_default=True)
 @click.option('--num-workers',      help='Number of workers in the dataloader', metavar='INT',  type=int, default=2, show_default=True)
 @click.option('--prefetch_factor',  help='Number of batches for each worker', metavar='INT',    type=int, default=2, show_default=True)
 @click.option('--fp16/--no-fp16',   help='Enable mixed-precision training', metavar='BOOL',     default=True, show_default=True)
 @click.option('--ls',               help='Loss scaling', metavar='FLOAT',                       type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',            help='Enable cuDNN benchmarking', metavar='BOOL',           type=bool, default=True, show_default=True)
+@click.option('--force-finite',     help='Zero NaN/Inf gradients before optimizer step',        metavar='BOOL', type=bool, default=True, show_default=True)
 
 # I/O-related options.
 @click.option('--status',           help='Interval of status prints', metavar='NIMG',           type=parse_nimg, default='128Ki', show_default=True)

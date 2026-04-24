@@ -16,7 +16,8 @@ class FlowMatchingModel(torch.nn.Module):
         t_scale=1000,
         eps=0.05,
         use_fp16=False,
-        net_kwargs=None
+        net_kwargs=None,
+        interpolant_kwargs=None,
     ):
         assert pred in ["x", "v"]
         super().__init__()
@@ -31,6 +32,9 @@ class FlowMatchingModel(torch.nn.Module):
             self.register_buffer('uncond_label', torch.zeros([1, label_dim]))
         else:
             self.uncond_label = None
+        if interpolant_kwargs is None:
+            interpolant_kwargs = dict(class_name='training.interpolants.LinearInterpolant')
+        self.interpolant = dnnlib.util.construct_class_by_name(**interpolant_kwargs)
         self.net = dnnlib.util.construct_class_by_name(
             img_resolution=img_resolution,
             in_channels=img_channels,
@@ -47,8 +51,13 @@ class FlowMatchingModel(torch.nn.Module):
                  if (self.use_fp16 and not force_fp32 and xt.device.type == 'cuda')
                  else torch.float32)
 
+        # Normalize t to [0, 1] before scaling so that t_scale has consistent
+        # semantics across interpolants with different t ranges.
+        t_min, t_max = self.interpolant.t_min, self.interpolant.t_max
+        t_norm = (t - t_min) / (t_max - t_min)
+        t_scaled = t_norm * self.t_scale
+
         # Net runs in FP16, but scaling is done in FP32.
-        t_scaled = t * self.t_scale
         F_x = self.net(
             (xt / self.sigma_data).to(dtype),
             t_scaled,
@@ -59,24 +68,25 @@ class FlowMatchingModel(torch.nn.Module):
             return pred
         elif self.pred == "x":
             t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
-            v_pred = (pred - xt) / (1 - t_broad).clamp(min=self.eps)
+            alpha = self.interpolant.alpha(t_broad).clamp(min=self.eps)
+            beta = self.interpolant.beta(t_broad)
+            alpha_dot = self.interpolant.alpha_dot(t_broad)
+            beta_dot = self.interpolant.beta_dot(t_broad)
+            # v = (alpha_dot / alpha) * xt + (beta_dot - alpha_dot * beta / alpha) * x1_hat
+            v_pred = (alpha_dot / alpha) * xt + (beta_dot - alpha_dot * beta / alpha) * pred
             return v_pred
 
 
 def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
     """
     Sample from the model using a 2nd-order Heun solver with CFG support.
-    
-    Args:
-        labels: The conditional labels (Tensor).
-        n_samples: Number of samples to generate.
-        n_steps: Number of discretization steps.
-        device: Torch device.
-        guidance: CFG scale (1.0 means no guidance).
+    Integrates the ODE dx/dt = v from t_min to t_max (defined by model.interpolant).
     """
     device = next(model.parameters()).device
+    interp = model.interpolant
+    t_min, t_max = interp.t_min, interp.t_max
+    dt = (t_max - t_min) / n_steps
 
-    dt = 1.0 / n_steps
     if noise is None:
         x = torch.randn(
             n_samples, model.img_channels, model.img_resolution, model.img_resolution,
@@ -102,19 +112,19 @@ def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
 
     with torch.no_grad():
         for i in range(n_steps):
-            t = torch.full([n_samples], i * dt, device=device)
-            
+            t = torch.full([n_samples], t_min + i * dt, device=device)
+
             # First evaluation (k1)
             k1 = get_guided_v(x, t, labels)
-            
-            # Check if we are on the final step and predicting x to avoid t=1.0 singularity
+
+            # Avoid evaluating the model at t_max when predicting x (alpha->0 singularity)
             if i == n_steps - 1 and model.pred == "x":
                 x = x + dt * k1
             else:
                 # Standard Heun correction (2nd order)
                 x_pred = x + dt * k1
-                t_next = torch.full([n_samples], (i + 1) * dt, device=device)
-                
+                t_next = torch.full([n_samples], t_min + (i + 1) * dt, device=device)
+
                 # Second evaluation (k2)
                 k2 = get_guided_v(x_pred, t_next, labels)
                 x = x + 0.5 * dt * (k1 + k2)
