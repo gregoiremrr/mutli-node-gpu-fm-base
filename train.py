@@ -18,6 +18,7 @@ dataset_presets = {
     'cifar10': dnnlib.EasyDict(
         sigma_data=0.5,
         eps=0.05,
+        phema_stds=[0.050, 0.100, 0.200],
         net_kwargs=dnnlib.EasyDict(
             class_name='training.networks.SongUNet',
             embedding_type='positional',
@@ -77,7 +78,7 @@ config_presets = {
     'fm-cifar10-trig': dnnlib.EasyDict(
         dataset='cifar10',
         cond=True,
-        total_nimg=200_000 * 64,
+        total_nimg=200_000 * 256,
         batch_size=256,
         pred='v',
         t_scale=1000,
@@ -164,7 +165,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
         interpolant_kwargs=dnnlib.EasyDict(**opts.interpolant_kwargs),
         use_fp16=opts.fp16,
     )
-    c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA')
+    c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA', stds=list(opts.phema_stds))
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss', p_uncond=opts.p_uncond_labels)
     c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.99))
     c.lr_kwargs = dnnlib.EasyDict(
