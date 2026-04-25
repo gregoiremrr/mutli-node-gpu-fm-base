@@ -59,7 +59,10 @@ config_presets = {
         dropout=0.0,
         lr=1e-3,
         max_clip_norm=1.0,
-        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.LinearInterpolant'),
+        interpolant_kwargs=dnnlib.EasyDict(
+            class_name='training.interpolants.LinearInterpolant',
+            t_dist_kwargs=dnnlib.EasyDict(class_name='training.interpolants.UniformDist'),
+        ),
     ),
     'fm-cifar10-xpred': dnnlib.EasyDict(
         dataset='cifar10',
@@ -73,13 +76,16 @@ config_presets = {
         dropout=0.0,
         lr=1e-3,
         max_clip_norm=1.0,
-        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.LinearInterpolant'),
+        interpolant_kwargs=dnnlib.EasyDict(
+            class_name='training.interpolants.LinearInterpolant',
+            t_dist_kwargs=dnnlib.EasyDict(class_name='training.interpolants.UniformDist'),
+        ),
     ),
     'fm-cifar10-trig': dnnlib.EasyDict(
         dataset='cifar10',
         cond=True,
-        total_nimg=200_000 * 256,
-        batch_size=256,
+        total_nimg=400_000 * 512,
+        batch_size=512,
         pred='v',
         t_scale=1000,
         p_uncond_labels=0.13,
@@ -87,7 +93,14 @@ config_presets = {
         dropout=0.0,
         lr=1e-3,
         max_clip_norm=1.0,
-        interpolant_kwargs=dnnlib.EasyDict(class_name='training.interpolants.TrigInterpolant'),
+        interpolant_kwargs=dnnlib.EasyDict(
+            class_name='training.interpolants.TrigInterpolant',
+            t_dist_kwargs=dnnlib.EasyDict(
+                class_name='training.interpolants.LogitNormalDist',
+                loc=0.0,
+                scale=1.0,
+            ),
+        ),
     ),
 }
 

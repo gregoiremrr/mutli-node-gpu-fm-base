@@ -68,29 +68,31 @@ class FlowMatchingModel(torch.nn.Module):
             return pred
         elif self.pred == "x":
             t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
-            alpha = self.interpolant.alpha(t_broad).clamp(min=self.eps)
-            beta = self.interpolant.beta(t_broad)
-            alpha_dot = self.interpolant.alpha_dot(t_broad)
-            beta_dot = self.interpolant.beta_dot(t_broad)
-            # v = (alpha_dot / alpha) * xt + (beta_dot - alpha_dot * beta / alpha) * x1_hat
-            v_pred = (alpha_dot / alpha) * xt + (beta_dot - alpha_dot * beta / alpha) * pred
+            data_coef = self.interpolant.data_coef(t_broad)
+            noise_coef = self.interpolant.noise_coef(t_broad).clamp(min=self.eps)
+            data_dot = self.interpolant.data_coef_dot(t_broad)
+            noise_dot = self.interpolant.noise_coef_dot(t_broad)
+            # x_t = data_coef * x_data + noise_coef * x_noise  =>  x_noise = (x_t - data_coef * x_data) / noise_coef
+            # v   = data_dot * x_data + noise_dot * x_noise
+            #     = (noise_dot / noise_coef) * x_t + (data_dot - data_coef * noise_dot / noise_coef) * x_data
+            v_pred = (noise_dot / noise_coef) * xt + (data_dot - data_coef * noise_dot / noise_coef) * pred
             return v_pred
 
 
 def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
     """
     Sample from the model using a 2nd-order Heun solver with CFG support.
-    Integrates the ODE dx/dt = v from t_min to t_max (defined by model.interpolant).
+    Integrates dx/dt = v over the grid returned by `model.interpolant.sample_steps`,
+    which goes from t_noise to t_data.
     """
     device = next(model.parameters()).device
     interp = model.interpolant
-    t_min, t_max = interp.t_min, interp.t_max
-    dt = (t_max - t_min) / n_steps
+    schedule = interp.sample_steps(n_steps, device)  # [n_steps + 1]
 
     if noise is None:
         x = torch.randn(
             n_samples, model.img_channels, model.img_resolution, model.img_resolution,
-            device=device
+            device=device,
         ) * model.sigma_data
     else:
         x = noise * model.sigma_data
@@ -99,8 +101,7 @@ def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
         if guidance == 1.0 or model.uncond_label is None:
             return model(xt, t_cur, class_labels=labels)
 
-        # Batch the conditional and unconditional passes together for efficiency
-        # Double the batch size: [conditional_batch, unconditional_batch]
+        # Batch the conditional and unconditional passes together for efficiency.
         xt_combined = torch.cat([xt, xt], dim=0)
         t_combined = torch.cat([t_cur, t_cur], dim=0)
         l_combined = torch.cat([labels, model.uncond_label], dim=0)
@@ -112,21 +113,19 @@ def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
 
     with torch.no_grad():
         for i in range(n_steps):
-            t = torch.full([n_samples], t_min + i * dt, device=device)
+            t_cur = schedule[i].expand(n_samples)
+            t_next = schedule[i + 1].expand(n_samples)
+            dt = schedule[i + 1] - schedule[i]  # signed, depends on data_side
 
-            # First evaluation (k1)
-            k1 = get_guided_v(x, t, labels)
+            # First evaluation (k1).
+            k1 = get_guided_v(x, t_cur, labels)
 
-            # Avoid evaluating the model at t_max when predicting x (alpha->0 singularity)
+            # Avoid evaluating the model at t_data when predicting x (noise_coef -> 0).
             if i == n_steps - 1 and model.pred == "x":
                 x = x + dt * k1
             else:
-                # Standard Heun correction (2nd order)
-                x_pred = x + dt * k1
-                t_next = torch.full([n_samples], t_min + (i + 1) * dt, device=device)
-
-                # Second evaluation (k2)
-                k2 = get_guided_v(x_pred, t_next, labels)
+                # Heun correction (2nd order).
+                k2 = get_guided_v(x + dt * k1, t_next, labels)
                 x = x + 0.5 * dt * (k1 + k2)
 
     return x

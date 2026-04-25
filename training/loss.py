@@ -22,14 +22,13 @@ class FlowMatchingLoss:
         interp = model.module.interpolant
         sigma_data = model.module.sigma_data
 
-        # Sample t uniformly in the interpolant's time range.
-        t = torch.rand(images.shape[0], device=images.device)
-        t = t * (interp.t_max - interp.t_min) + interp.t_min
+        # Sample t from the interpolant's training distribution.
+        t = interp.sample_t(images.shape[0], images.device)
         t_expanded = t.view(-1, *([1] * (images.ndim - 1)))
 
-        x0 = torch.randn_like(images) * sigma_data
-        xt = interp.alpha(t_expanded) * x0 + interp.beta(t_expanded) * images
-        v_target = interp.alpha_dot(t_expanded) * x0 + interp.beta_dot(t_expanded) * images
+        x_noise = torch.randn_like(images) * sigma_data
+        xt = interp.data_coef(t_expanded) * images + interp.noise_coef(t_expanded) * x_noise
+        v_target = interp.data_coef_dot(t_expanded) * images + interp.noise_coef_dot(t_expanded) * x_noise
 
         v_pred = model(xt, t, labels)
 
