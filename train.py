@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import warnings
 import click
@@ -9,6 +10,15 @@ import training.training_loop
 import datetime
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
+
+#----------------------------------------------------------------------------
+
+def _wait_for_path(path, timeout=300, interval=0.1):
+    deadline = time.time() + timeout
+    while not os.path.exists(path):
+        if time.time() > deadline:
+            raise TimeoutError(f'Timed out after {timeout}s waiting for {path}')
+        time.sleep(interval)
 
 #----------------------------------------------------------------------------
 # Dataset presets: things intrinsic to the data (network shape,
@@ -223,13 +233,18 @@ def print_training_config(run_dir, pretrained_pkl, c):
 # Launch training.
 
 def launch_training(run_dir, pretrained_pkl, c):
-    if dist.get_rank() == 0 and not os.path.isdir(run_dir):
-        dist.print0('Creating output directory...')
-        os.makedirs(run_dir)
-        with open(os.path.join(run_dir, 'training_options.json'), 'wt') as f:
+    options_path = os.path.join(run_dir, 'training_options.json')
+    if dist.get_rank() == 0:
+        if not os.path.isdir(run_dir):
+            dist.print0('Creating output directory...')
+            os.makedirs(run_dir)
+        with open(options_path, 'wt') as f:
             json.dump(c, f, indent=2)
+    else:
+        # Wait until rank 0 has created the run directory and written the
+        # training options file.
+        _wait_for_path(options_path)
 
-    torch.distributed.barrier()
     dnnlib.util.Logger(file_name=os.path.join(run_dir, 'log.txt'), file_mode='a', should_flush=True)
     training.training_loop.training_loop(run_dir=run_dir, pretrained_pkl=pretrained_pkl, **c)
 
@@ -306,17 +321,22 @@ def cmdline(outdir, pretrained_pkl, dry_run, **opts):
         if pretrained_pkl:
             raise click.ClickException('Cannot use --pretrained when resuming from an existing run')
     else:
-        now = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-        if dist.get_world_size() > 1:
-            if dist.get_rank() == 0:
-                name_bytes = now.encode('utf-8')
-            else:
-                name_bytes = b'\x00' * 20
-            name_tensor = torch.ByteTensor(list(name_bytes)).cuda()
-            torch.distributed.broadcast(name_tensor, src=0)
-            now = bytes(name_tensor.tolist()).decode('utf-8').rstrip('\x00')
+        # Pick a fresh timestamped run_dir on rank 0 and share it via the filesystem.
         preset_name = opts.get('preset', 'run')
-        run_dir = os.path.join(outdir, f'{now}_{preset_name}')
+        os.makedirs(outdir, exist_ok=True)
+        # Use the torchelastic run id (set per `torchrun` invocation) so the
+        # marker file is unique to this launch and can be cleaned up safely.
+        run_id = os.environ.get('TORCHELASTIC_RUN_ID', os.environ.get('MASTER_PORT', 'default'))
+        marker_path = os.path.join(outdir, f'.run_dir.{run_id}')
+        if dist.get_rank() == 0:
+            now = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+            run_dir = os.path.join(outdir, f'{now}_{preset_name}')
+            with open(marker_path, 'wt') as f:
+                f.write(run_dir)
+        else:
+            _wait_for_path(marker_path)
+            with open(marker_path, 'rt') as f:
+                run_dir = f.read().strip()
 
     print_training_config(run_dir=run_dir, pretrained_pkl=pretrained_pkl, c=c)
     if dry_run:
