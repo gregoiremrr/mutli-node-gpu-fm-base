@@ -11,6 +11,7 @@ from torch_utils import training_stats
 from torch_utils import misc
 import wandb
 from training import monitoring
+from training import evaluation
 
 #----------------------------------------------------------------------------
 # Main training loop.
@@ -36,6 +37,8 @@ def training_loop(
     status_nimg,            # Report status every N training images. None = disable.
     snapshot_nimg,          # Save model snapshot every N training images. None = disable.
     checkpoint_nimg,        # Save state checkpoint every N training images. None = disable.
+    metrics_nimg,           # Compute eval metrics every N training images. None = disable.
+    metrics_kwargs,         # dict(metrics, ref_path, num_samples, max_batch_size). Required if metrics_nimg is set.
 
     loss_scaling,           # Loss scaling factor for reducing FP16 under/overflows.
     cudnn_benchmark,        # Enable torch.backends.cudnn.benchmark?
@@ -65,6 +68,10 @@ def training_loop(
     assert status_nimg is None or status_nimg % batch_size == 0
     assert snapshot_nimg is None or snapshot_nimg % batch_size == 0
     assert checkpoint_nimg is None or checkpoint_nimg % batch_size == 0
+    assert metrics_nimg is None or metrics_nimg % batch_size == 0
+    if metrics_nimg is not None:
+        assert metrics_kwargs is not None and metrics_kwargs.get('ref_path'), \
+            '--metrics requires --metric-ref to be set'
 
     # Setup dataset and encoder.
     dist.print0('Loading dataset...')
@@ -206,7 +213,10 @@ def training_loop(
                         ema_model, encoder, sampler_kwargs,
                         n_samples=16,
                         label_dim=model.label_dim,
-                        seed=state.cur_step,
+                        # Cycle the seed by status-tick index so consecutive
+                        # ticks use different noise/labels but every 20 ticks
+                        # we revisit the same ones (handy for visual diffs).
+                        seed=(state.cur_nimg // status_nimg) % 20,
                         device=device,
                     )
                     grid_np = grid.permute(1, 2, 0).cpu().numpy()
@@ -217,6 +227,8 @@ def training_loop(
                     'grad_norm': step_stats.get('grad_norm', float('nan')),
                 }
                 metrics = {
+                    'weighted_loss': step_stats.get('weighted_loss', float('nan')),
+                    'logvar': step_stats.get('logvar', float('nan')),
                     'clip_coef': step_stats.get('clip_coef', float('nan')),
                     'sec_per_tick': sec_per_tick,
                     'sec_per_kimg': sec_per_kimg,
@@ -238,6 +250,50 @@ def training_loop(
             dist.update_progress(state.cur_nimg // 1000, total_nimg // 1000)
             if dist.should_stop() or dist.should_suspend():
                 done = True
+
+        # Compute eval metrics (FID / FD-DINOv2) on the current EMA model.
+        # Runs on every rank because the feature accumulation is distributed,
+        # but only rank 0 ends up with the final scalars and logs them to W&B.
+        if (metrics_nimg is not None
+                and (done or state.cur_nimg % metrics_nimg == 0)
+                and state.cur_nimg != start_nimg):
+            if ema is not None:
+                ema_model = ema.get()
+                if isinstance(ema_model, list):
+                    ema_model = ema_model[0][0]
+                ema_model.eval()
+
+                metric_start = time.time()
+                dist.print0(f'Computing metrics ({", ".join(metrics_kwargs["metrics"])}) '
+                            f'on {metrics_kwargs["num_samples"]} samples...')
+                metric_results = evaluation.compute_metrics(
+                    model=ema_model,
+                    encoder=encoder,
+                    sampler_kwargs=sampler_kwargs,
+                    ref_path=metrics_kwargs['ref_path'],
+                    num_samples=metrics_kwargs['num_samples'],
+                    metrics=metrics_kwargs['metrics'],
+                    max_batch_size=metrics_kwargs['max_batch_size'],
+                    seed=0, # Fixed seed so each FID tick uses the same noise/labels
+                    device=device,
+                )
+                metric_elapsed = time.time() - metric_start
+
+                if dist.get_rank() == 0 and metric_results is not None:
+                    msg = ', '.join(f'{k}={v:g}' for k, v in metric_results.items())
+                    dist.print0(f'Metrics @ kimg {state.cur_nimg/1e3:.1f}: {msg} '
+                                f'(took {metric_elapsed:.1f}s)')
+                    if wandb_run is not None:
+                        monitoring.log_to_wandb(
+                            wandb,
+                            cur_step=state.cur_step,
+                            cur_nimg=state.cur_nimg,
+                            elapsed_time=state.total_elapsed_time,
+                            main_metrics=metric_results,
+                            metrics={'metric_eval_sec': metric_elapsed},
+                        )
+                # Don't count the eval time as training time on the next tick.
+                prev_status_time = time.time()
 
         # Save model snapshot.
         if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
@@ -263,7 +319,11 @@ def training_loop(
             break
 
         # Evaluate loss and accumulate gradients.
+        # `loss` here is the raw (unweighted) MSE.
+        # `weighted_loss` is the actual training objective.
         step_stats.loss = 0
+        step_stats.weighted_loss = 0
+        step_stats.logvar = 0
         batch_start_time = time.time()
         misc.set_random_seed(seed, dist.get_rank(), state.cur_step)
         optimizer.zero_grad(set_to_none=True)
@@ -272,12 +332,14 @@ def training_loop(
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
 
-                raw_loss = loss_fn(model=ddp, images=images, labels=labels.to(device))
+                weighted_loss, loss_stats = loss_fn(model=ddp, images=images, labels=labels.to(device))
 
-                training_stats.report('Loss/loss', raw_loss)
-                step_stats.loss += raw_loss.item() / num_accumulation_rounds
+                training_stats.report('Loss/loss', loss_stats['mse'])
+                step_stats.loss += loss_stats['mse'].item() / num_accumulation_rounds
+                step_stats.weighted_loss += weighted_loss.item() / num_accumulation_rounds
+                step_stats.logvar += loss_stats['logvar'].item() / num_accumulation_rounds
 
-                loss = raw_loss * (loss_scaling / num_accumulation_rounds)
+                loss = weighted_loss * (loss_scaling / num_accumulation_rounds)
                 loss.backward()
 
         # Run optimizer and update weights.

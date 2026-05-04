@@ -1,9 +1,23 @@
-torchrun --standalone --nproc_per_node=1 train.py \
+# /etc/nccl.conf on GCE Deep Learning VMs forces NCCL_NET=gIB, which is
+# Google's GPUDirect-RDMA networking stack for A3/H100 instances. On A2/A100
+# (or any single-node run) gIB has no fabric to talk to and fails to init.
+# Override here to use the built-in Socket transport for the control plane;
+# NCCL still uses NVLink/P2P for actual GPU<->GPU traffic.
+export NCCL_NET=Socket
+export NCCL_SOCKET_IFNAME=lo
+export NCCL_IB_DISABLE=1
+
+torchrun --standalone --nproc_per_node=2 train.py \
     --outdir=training-runs/cifar10 \
     --data=datasets/cifar10.zip \
-    --preset=fm-cifar10-xpred \
+    --preset=fm-cifar10-trig \
     --max-batch-gpu=256 \
     --no-fp16 \
     --status=20Ki \
-    --snapshot=256Ki \
-    --checkpoint=512Ki
+    --snapshot=1Mi \
+    --checkpoint=2Mi \
+    --metrics=6Mi \
+    --metric-names=fid \
+    --metric-num-samples=10000 \
+    --metric-ref=fid-refs/cifar10.pkl \
+    --metric-batch-size=512

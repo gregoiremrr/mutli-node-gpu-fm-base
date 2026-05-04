@@ -80,6 +80,14 @@ class Conv2d(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
+# Pixel normalization (Karras et al., 2017): RMS-norm across the channel dim.
+# Used as `pnorm(.)` in the Adaptive Double Normalization variant of AdaGN.
+
+def pixel_norm(x, eps=1e-8):
+    # x: [B, C, ...] -> normalize along channel dim.
+    return x * torch.rsqrt(x.to(torch.float32).pow(2).mean(dim=1, keepdim=True) + eps).to(x.dtype)
+
+#----------------------------------------------------------------------------
 # Group normalization.
 
 @persistence.persistent_class
@@ -126,9 +134,14 @@ class UNetBlock(torch.nn.Module):
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
         resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
+        adaptive_double_norm=False,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None,
     ):
         super().__init__()
+        # Adaptive Double Normalization is a drop-in replacement for AdaGN, so it
+        # only makes sense when adaptive_scale is on (i.e. we have scale+shift).
+        assert not adaptive_double_norm or adaptive_scale, \
+            'adaptive_double_norm=True requires adaptive_scale=True'
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.emb_channels = emb_channels
@@ -136,6 +149,7 @@ class UNetBlock(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.adaptive_double_norm = adaptive_double_norm
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
@@ -160,7 +174,15 @@ class UNetBlock(torch.nn.Module):
         params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
         if self.adaptive_scale:
             scale, shift = params.chunk(chunks=2, dim=1)
-            x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
+            if self.adaptive_double_norm:
+                # Adaptive Double Normalization: y = norm(x) * pnorm(s(t)) + pnorm(b(t)).
+                # No "+1" offset on the scale here: pnorm already bounds its magnitude,
+                # and the (+1) trick exists only to initialize AdaGN as the identity.
+                scale = pixel_norm(scale)
+                shift = pixel_norm(shift)
+                x = silu(torch.addcmul(shift, self.norm1(x), scale))
+            else:
+                x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
         else:
             x = silu(self.norm1(x.add_(params)))
 
@@ -237,6 +259,10 @@ class SongUNet(torch.nn.Module):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+
+        adaptive_double_norm = False,       # Use Adaptive Double Normalization (pnorm'd AdaGN).
+                                            # False = additive timestep embedding (default DDPM++/NCSN++).
+                                            # True  = y = norm(x) * pnorm(s(t)) + pnorm(b(t)). Implies adaptive_scale=True.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -249,9 +275,13 @@ class SongUNet(torch.nn.Module):
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+        # Adaptive Double Normalization is a variant of AdaGN, so we must enable
+        # the scale/shift path (adaptive_scale) whenever it is requested.
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
-            resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
+            resample_filter=resample_filter, resample_proj=True,
+            adaptive_scale=adaptive_double_norm,
+            adaptive_double_norm=adaptive_double_norm,
             init=init, init_zero=init_zero, init_attn=init_attn,
         )
 

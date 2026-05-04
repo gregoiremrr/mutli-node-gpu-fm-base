@@ -7,6 +7,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 import training.training_loop
+from calculate_metrics import parse_metric_list
 import datetime
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
@@ -38,6 +39,7 @@ dataset_presets = {
             resample_filter=[1, 1],
             channel_mult=[2, 2, 2],
             attn_resolutions=[16],
+            adaptive_double_norm=True,
         ),
         sampler_kwargs=dnnlib.EasyDict(
             func_name='training.model.sample',
@@ -46,7 +48,6 @@ dataset_presets = {
         ),
         lr_scheduler_kwargs=dnnlib.EasyDict(
             func_name='training.schedulers.cosine_lr',
-            warmup_nimg=5_000 * 256,
         ),
     ),
 }
@@ -68,6 +69,7 @@ config_presets = {
         channels=128,
         dropout=0.0,
         lr=1e-3,
+        warmup_nimg=5_000 * 256,
         max_clip_norm=1.0,
         interpolant_kwargs=dnnlib.EasyDict(
             class_name='training.interpolants.LinearInterpolant',
@@ -85,6 +87,7 @@ config_presets = {
         channels=128,
         dropout=0.0,
         lr=1e-3,
+        warmup_nimg=5_000 * 256,
         max_clip_norm=1.0,
         interpolant_kwargs=dnnlib.EasyDict(
             class_name='training.interpolants.LinearInterpolant',
@@ -100,15 +103,17 @@ config_presets = {
         t_scale=1000,
         p_uncond_labels=0.13,
         channels=128,
-        dropout=0.0,
+        dropout=0.13,
         lr=1e-3,
+        warmup_nimg=20_000 * 512,
         max_clip_norm=1.0,
         interpolant_kwargs=dnnlib.EasyDict(
             class_name='training.interpolants.TrigInterpolant',
             t_dist_kwargs=dnnlib.EasyDict(
-                class_name='training.interpolants.LogitNormalDist',
-                loc=0.0,
-                scale=1.0,
+                class_name='training.interpolants.LogNormalDist',
+                P_mean=-1.2,
+                P_std=1.2,
+                sigma_data=0.5,
             ),
         ),
     ),
@@ -147,7 +152,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
     c = dnnlib.EasyDict()
 
     # Dataset and Dataloader.
-    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond)
+    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=True)
     try:
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
         dataset_channels = dataset_obj.num_channels
@@ -190,11 +195,12 @@ def setup_training_config(preset='fm-cifar10', **opts):
     )
     c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA', stds=list(opts.phema_stds))
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss', p_uncond=opts.p_uncond_labels)
-    c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.99))
+    c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.999))
     c.lr_kwargs = dnnlib.EasyDict(
         **opts.lr_scheduler_kwargs,
         base_lr=opts.lr,
         total_nimg=opts.total_nimg,
+        warmup_nimg=opts.warmup_nimg,
     )
     c.sampler_kwargs = dnnlib.EasyDict(**opts.sampler_kwargs)
     c.max_clip_norm = opts.max_clip_norm
@@ -209,6 +215,25 @@ def setup_training_config(preset='fm-cifar10', **opts):
     c.status_nimg = opts.status or None
     c.snapshot_nimg = opts.snapshot or None
     c.checkpoint_nimg = opts.checkpoint or None
+
+    # Eval metrics (FID / FD-DINOv2).
+    c.metrics_nimg = opts.metrics or None
+    if c.metrics_nimg is not None:
+        if not opts.metric_ref:
+            raise click.ClickException('--metrics requires --metric-ref')
+        # If metric_ref is a local path (not a URL), make sure it exists now
+        # rather than failing after the first metric tick.
+        if '://' not in opts.metric_ref and not os.path.isfile(opts.metric_ref):
+            raise click.ClickException(f'--metric-ref: file not found: {opts.metric_ref}')
+        c.metrics_kwargs = dnnlib.EasyDict(
+            metrics=parse_metric_list(opts.metric_names),
+            ref_path=opts.metric_ref,
+            num_samples=opts.metric_num_samples,
+            max_batch_size=opts.metric_batch_size,
+        )
+    else:
+        c.metrics_kwargs = None
+
     c.seed = opts.seed
     return c
 
@@ -302,6 +327,14 @@ def parse_nimg(s):
 @click.option('--status',           help='Interval of status prints', metavar='NIMG',           type=parse_nimg, default='128Ki', show_default=True)
 @click.option('--snapshot',         help='Interval of network snapshots', metavar='NIMG',       type=parse_nimg, default='8Mi', show_default=True)
 @click.option('--checkpoint',       help='Interval of training checkpoints', metavar='NIMG',    type=parse_nimg, default='128Mi', show_default=True)
+
+# Eval-metrics-related options.
+@click.option('--metrics',          help='Interval of FID/FD-DINOv2 evaluation. Disabled by default.', metavar='NIMG', type=parse_nimg, default=None, show_default=True)
+@click.option('--metric-names',     help='Comma-separated list of metrics to compute', metavar='LIST', type=str, default='fid', show_default=True)
+@click.option('--metric-num-samples', help='Number of generated samples to use for the metric', metavar='INT', type=click.IntRange(min=2), default=10000, show_default=True)
+@click.option('--metric-ref',       help='Reference statistics .pkl/.npz', metavar='PATH', type=str, default='fid-refs/cifar10.pkl', show_default=True)
+@click.option('--metric-batch-size',help='Per-rank batch size for metric sampling/feature extraction', metavar='INT', type=click.IntRange(min=1), default=64, show_default=True)
+
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 

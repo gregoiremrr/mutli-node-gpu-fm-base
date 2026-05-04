@@ -1,6 +1,7 @@
 import torch
 from torch_utils import persistence
 import dnnlib
+from training.networks import FourierEmbedding, Linear
 
 #----------------------------------------------------------------------------
 
@@ -18,6 +19,7 @@ class FlowMatchingModel(torch.nn.Module):
         use_fp16=False,
         net_kwargs=None,
         interpolant_kwargs=None,
+        logvar_channels=128,
     ):
         assert pred in ["x", "v"]
         super().__init__()
@@ -44,7 +46,11 @@ class FlowMatchingModel(torch.nn.Module):
         )
         self.pred = pred
 
-    def forward(self, xt, t, class_labels=None, force_fp32=False):
+        # EDM2-style adaptive loss weighting (Karras et al., 2024).
+        self.logvar_fourier = FourierEmbedding(num_channels=logvar_channels)
+        self.logvar_linear = Linear(in_features=logvar_channels, out_features=1, init_mode='kaiming_normal')
+
+    def forward(self, xt, t, class_labels=None, force_fp32=False, return_logvar=False):
         xt = xt.to(torch.float32)
         t = t.to(torch.float32)
         dtype = (torch.float16
@@ -65,7 +71,7 @@ class FlowMatchingModel(torch.nn.Module):
         )
         pred = self.sigma_data * F_x.to(torch.float32)
         if self.pred == "v":
-            return pred
+            v_pred = pred
         elif self.pred == "x":
             t_broad = t.reshape(-1, *([1] * (xt.ndim - 1)))
             data_coef = self.interpolant.data_coef(t_broad)
@@ -76,7 +82,14 @@ class FlowMatchingModel(torch.nn.Module):
             # v   = data_dot * x_data + noise_dot * x_noise
             #     = (noise_dot / noise_coef) * x_t + (data_dot - data_coef * noise_dot / noise_coef) * x_data
             v_pred = (noise_dot / noise_coef) * xt + (data_dot - data_coef * noise_dot / noise_coef) * pred
+
+        if not return_logvar:
             return v_pred
+
+        # Per-sample logvar(t), broadcastable to v_pred shape.
+        logvar = self.logvar_linear(self.logvar_fourier(t))
+        logvar = logvar.reshape(-1, *([1] * (xt.ndim - 1)))
+        return v_pred, logvar
 
 
 def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
@@ -120,8 +133,8 @@ def sample(model, labels, n_samples, n_steps, guidance=1.0, noise=None):
             # First evaluation (k1).
             k1 = get_guided_v(x, t_cur, labels)
 
-            # Avoid evaluating the model at t_data when predicting x (noise_coef -> 0).
-            if i == n_steps - 1 and model.pred == "x":
+            # Skip the Heun correction at the very last integration step.
+            if i == n_steps - 1:
                 x = x + dt * k1
             else:
                 # Heun correction (2nd order).

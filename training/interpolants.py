@@ -46,6 +46,30 @@ class LogitNormalDist:
         z = torch.randn(batch_size, device=device) * self.scale + self.loc
         return torch.sigmoid(z) * (t_max - t_min) + t_min
 
+
+@persistence.persistent_class
+class LogNormalDist:
+    """Log-normal noise schedule from EDM / TrigFlow:
+
+        log(sigma) ~ N(P_mean, P_std)
+
+    For the trig interpolant, sigma is the equivalent EDM noise level
+    sigma = sigma_data * tan(t), so this samples
+        t = atan(exp(P_mean + P_std * eps) / sigma_data),  eps ~ N(0, 1).
+
+    Defaults match EDM/TrigFlow CIFAR-10 (P_mean=-1.2, P_std=1.2, sigma_data=0.5).
+    Only meaningful for the trig interpolant (t in [0, pi/2], data at t=0)."""
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+        self.P_mean = float(P_mean)
+        self.P_std = float(P_std)
+        self.sigma_data = float(sigma_data)
+
+    def sample(self, batch_size, device, t_min, t_max):
+        log_sigma = torch.randn(batch_size, device=device) * self.P_std + self.P_mean
+        sigma = log_sigma.exp()
+        t = (sigma / self.sigma_data).atan()
+        return t.clamp(min=t_min, max=t_max)
+
 #----------------------------------------------------------------------------
 # Interpolant base class.
 

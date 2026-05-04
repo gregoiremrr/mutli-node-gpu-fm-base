@@ -30,9 +30,17 @@ class FlowMatchingLoss:
         xt = interp.data_coef(t_expanded) * images + interp.noise_coef(t_expanded) * x_noise
         v_target = interp.data_coef_dot(t_expanded) * images + interp.noise_coef_dot(t_expanded) * x_noise
 
-        v_pred = model(xt, t, labels)
+        v_pred, logvar = model(xt, t, labels, return_logvar=True)
 
-        loss = (v_pred - v_target).square().mean()
-        return loss
+        # EDM2-style adaptive weighting (Karras et al., 2024).
+        residual_sq = (v_pred - v_target).square()
+        weighted_loss = (torch.exp(-logvar) * residual_sq + logvar).mean()
+
+        # Side stats.
+        stats = dict(
+            mse=residual_sq.mean().detach(),
+            logvar=logvar.mean().detach(),
+        )
+        return weighted_loss, stats
 
 #----------------------------------------------------------------------------
