@@ -75,6 +75,13 @@ config_presets = {
             class_name='training.interpolants.LinearInterpolant',
             t_dist_kwargs=dnnlib.EasyDict(class_name='training.interpolants.UniformDist'),
         ),
+        optimizer_kwargs=dnnlib.EasyDict(
+            class_name='torch.optim.AdamW',
+            lr=2e-4,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0,
+        ),
     ),
     'fm-cifar10-xpred': dnnlib.EasyDict(
         dataset='cifar10',
@@ -92,6 +99,13 @@ config_presets = {
         interpolant_kwargs=dnnlib.EasyDict(
             class_name='training.interpolants.LinearInterpolant',
             t_dist_kwargs=dnnlib.EasyDict(class_name='training.interpolants.UniformDist'),
+        ),
+        optimizer_kwargs=dnnlib.EasyDict(
+            class_name='torch.optim.AdamW',
+            lr=2e-4,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0,
         ),
     ),
     'fm-cifar10-trig': dnnlib.EasyDict(
@@ -115,6 +129,13 @@ config_presets = {
                 P_std=1.2,
                 sigma_data=0.5,
             ),
+        ),
+        optimizer_kwargs=dnnlib.EasyDict(
+            class_name='torch.optim.AdamW',
+            lr=2e-4,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0,
         ),
     ),
 }
@@ -195,7 +216,7 @@ def setup_training_config(preset='fm-cifar10', **opts):
     )
     c.ema_kwargs = dict(class_name='training.phema.PowerFunctionEMA', stds=list(opts.phema_stds))
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FlowMatchingLoss', p_uncond=opts.p_uncond_labels)
-    c.optimizer_kwargs = dict(class_name='torch.optim.AdamW', weight_decay=1e-3, betas=(0.9, 0.999))
+    c.optimizer_kwargs = dnnlib.EasyDict(**opts.optimizer_kwargs)
     c.lr_kwargs = dnnlib.EasyDict(
         **opts.lr_scheduler_kwargs,
         base_lr=opts.lr,
